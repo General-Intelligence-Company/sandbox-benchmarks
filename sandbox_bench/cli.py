@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import shutil
 import sys
 import tomllib
 import uuid
@@ -57,6 +58,8 @@ def configuration(path):
         "count",
         "batch_size",
         "concurrency",
+        "customer_headroom",
+        "organization_sandbox_limit",
         "lifecycles",
         "cpus",
         "memory_mb",
@@ -75,6 +78,8 @@ def configuration(path):
         "count": 5,
         "batch_size": 5,
         "concurrency": 5,
+        "customer_headroom": 0,
+        "organization_sandbox_limit": 0,
         "lifecycles": ["fresh"],
         "cpus": 4,
         "memory_mb": 8192,
@@ -103,6 +108,16 @@ def configuration(path):
         raise ValueError(
             "Maximum count is 1000, batch is 500, and concurrency cannot exceed batch_size"
         )
+    for key in ("customer_headroom", "organization_sandbox_limit"):
+        if type(c[key]) is not int or c[key] < 0:
+            raise ValueError(key + " must be a nonnegative integer")
+    if c["customer_headroom"] or c["organization_sandbox_limit"]:
+        if c["provider"] != "tensorlake":
+            raise ValueError("Organization capacity admission is supported for Tensorlake only")
+        if c["batch_size"] + c["customer_headroom"] > c["organization_sandbox_limit"]:
+            raise ValueError("batch_size must leave customer_headroom within organization_sandbox_limit")
+        if not c["customer_headroom"]:
+            raise ValueError("customer_headroom must be positive for capacity admission")
     if not c["lifecycles"] or len(set(c["lifecycles"])) != len(c["lifecycles"]):
         raise ValueError("Choose unique lifecycle names")
     unsupported = set(c["lifecycles"]) - set(SPECS[c["provider"]].lifecycles)
@@ -160,19 +175,25 @@ def doctor(c):
     missing = [key for key in spec.env if not os.environ.get(key)]
     module = {"beam": "beam"}.get(c["provider"], c["provider"])
     installed = not spec.extra or importlib.util.find_spec(module) is not None
+    capacity_cli = not c.get("customer_headroom") or shutil.which("tl") is not None
     return {
         "provider": c["provider"],
         "suite": c["suite"],
         "missing_environment_variables": missing,
         "sdk_installed": installed,
+        "capacity_cli_available": capacity_cli,
         "install": f"pip install -e '.[{spec.extra}]'" if spec.extra else None,
         "credentials_checked": "presence only; no API calls",
         "notes": spec.notes,
         "count_per_lifecycle": c["count"],
         "maximum_owned_vms": min(c["batch_size"], c["count"])
-        + int(bool(set(c["lifecycles"]) & {"disk", "memory"}))
-        + int(c["prepared"] and c["suite"] == "workflow"),
-        "ok": not missing and installed,
+        + (
+            0
+            if PROVIDERS[c["provider"]].release_snapshot_source
+            else int(bool(set(c["lifecycles"]) & {"disk", "memory"}))
+            + int(c["prepared"] and c["suite"] == "workflow")
+        ),
+        "ok": not missing and installed and capacity_cli,
     }
 
 
