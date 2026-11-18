@@ -8,7 +8,7 @@ import httpx
 import pytest
 
 from sandbox_bench.cli import configuration, doctor, example
-from sandbox_bench.providers import SPECS, Boat, Command, Exe, ProviderError, Tensorlake
+from sandbox_bench.providers import SPECS, Boat, Command, Exe, Provider, ProviderError, Tensorlake
 from sandbox_bench.runner import Evidence, Runner, S3Fixture, complete, summarize
 
 
@@ -33,7 +33,7 @@ def evidence(tmp_path, c):
     )
 
 
-class FakeProvider:
+class FakeProvider(Provider):
     def __init__(self, ambiguous=False, failed_command=False, acknowledge_only=False):
         self.active = {}
         self.creates = []

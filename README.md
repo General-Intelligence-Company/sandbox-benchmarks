@@ -99,6 +99,15 @@ sandbox-bench report outputs/tensorlake-<run-id>
 sandbox-bench cleanup outputs/tensorlake-<run-id>
 ```
 
+Tensorlake cleanup closes command connections and processes at most 16 VMs at a
+time, with a 90-second deadline per VM. Timed-out deletions are recorded once;
+they are not automatically repeated. After inspecting the exact run-owned IDs,
+an operator can explicitly authorize one new delete with
+`sandbox-bench cleanup RUN_DIR --confirm-delete OWNED_ID ...`. Unknown IDs are
+rejected. An independent absence check reconciles the old ambiguous record while
+preserving its original error. Cleanup's exit code reports resource cleanup,
+independently of whether the measured workflows passed.
+
 - `run.json`: a checkpoint of configuration, lifecycle intents/results, ownership and per-case outcomes.
 - `updates/`: atomic trial and operation records written during dispatch. Keep this directory with `run.json`; `report` and `cleanup` combine both when a run is active or interrupted.
 - `summary.json`: attempted, passed, failed, ineligible and unrun counts; successful workflow mean/P95; activity and cleanup coverage.

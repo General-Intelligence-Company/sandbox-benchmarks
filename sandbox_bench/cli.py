@@ -14,7 +14,9 @@ from importlib.metadata import version
 from pathlib import Path
 
 from .providers import PROVIDERS, SPECS
-from .runner import Evidence, Runner, S3Fixture, assets, complete, now, summarize
+from .runner import (
+    Evidence, Runner, S3Fixture, assets, cleanup_complete, complete, now, summarize,
+)
 
 
 def example(provider):
@@ -201,6 +203,8 @@ async def execute(args):
     if args.command == "cleanup":
         e = Evidence(args.run_dir)
         c = e.state["config"]
+        if set(args.confirm_delete) - set(e.state["owned"]):
+            raise ValueError("Confirmed deletion IDs must belong to this run")
     else:
         c = configuration(args.config)
         run_id = uuid.uuid4().hex[:12]
@@ -253,7 +257,7 @@ async def execute(args):
             e.state["s3_cleanup"] = {"error": str(exc)}
         runner = Runner(c, p, e, fixture)
         if args.command == "cleanup":
-            await runner.cleanup()
+            await runner.cleanup(args.confirm_delete)
         else:
             print("Run evidence: " + str(e.path), flush=True)
             e.state["image_preparation"] = await p.prepare()
@@ -265,6 +269,8 @@ async def execute(args):
         report = summarize(e.state)
         (e.path / "summary.json").write_text(e.clean(report) + "\n")
         print(e.clean(report))
+    if args.command == "cleanup":
+        return 0 if cleanup_complete(report) else 1
     return 0 if complete(report, c) else 1
 
 
@@ -286,8 +292,16 @@ def main():
     )
     run.add_argument("--config", default="benchmark.toml")
     run.add_argument("--output", default="outputs")
-    for command in ("report", "cleanup"):
-        sub.add_parser(command).add_argument("run_dir")
+    sub.add_parser("report").add_argument("run_dir")
+    cleanup = sub.add_parser("cleanup")
+    cleanup.add_argument("run_dir")
+    cleanup.add_argument(
+        "--confirm-delete",
+        nargs="+",
+        default=[],
+        metavar="OWNED_ID",
+        help="Authorize one new delete of these inspected, run-owned IDs after an unconfirmed delete",
+    )
     args = parser.parse_args()
     try:
         if args.command == "providers":
