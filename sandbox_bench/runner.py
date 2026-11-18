@@ -62,6 +62,7 @@ class Evidence:
         fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         self.state = state if state is not None else self.read_state(self.path)
         self.sequence = self.state.get("journal_sequence", 0)
+        self.io_observations = []
         self.secrets = [
             v
             for k, v in os.environ.items()
@@ -112,9 +113,13 @@ class Evidence:
         return state
 
     def write(self, path, value):
+        started = time.monotonic()
         temp = path.with_suffix(path.suffix + ".tmp")
         temp.write_text(self.clean(value) + "\n")
         temp.replace(path)
+        self.io_observations.append(
+            {"kind": "write", "started": started, "finished": time.monotonic()}
+        )
 
     def save(self):
         # Full checkpoints run between measured phases. Dispatch writes only the
@@ -135,8 +140,12 @@ class Evidence:
         self.save_update("trial", f"{row['case']}-{row['index']}", row)
 
     def log(self, kind, **value):
+        started = time.monotonic()
         with (self.path / "events.jsonl").open("a") as stream:
             stream.write(self.clean({"at": now(), "kind": kind, **value}) + "\n")
+        self.io_observations.append(
+            {"kind": "log", "started": started, "finished": time.monotonic()}
+        )
 
     async def mutation(self, kind, fn, **context):
         op = {
@@ -228,7 +237,10 @@ class S3Fixture:
             )
 
     async def verify(self, write):
+        queued = time.monotonic()
+
         def read():
+            started = time.monotonic()
             from botocore.exceptions import (
                 ClientError,
                 ConnectionClosedError,
@@ -300,9 +312,18 @@ class S3Fixture:
                 **result,
                 "attempts": attempts,
                 "first_attempt_passed": attempts[0]["passed"],
+                "worker_started": started,
+                "worker_finished": time.monotonic(),
             }
 
         result = await asyncio.to_thread(read)
+        received = time.monotonic()
+        started, finished = result.pop("worker_started"), result.pop("worker_finished")
+        result.update(
+            thread_queue_s=started - queued,
+            worker_duration_s=finished - started,
+            thread_return_delay_s=received - finished,
+        )
         self.evidence.log("external_s3_read", key=write["key"], **result)
         return result
 
@@ -344,16 +365,33 @@ class Runner:
         self.slots = asyncio.Semaphore(config["concurrency"])
         self.run_id = self.e.state["run_id"]
         self.guest_round_trip_s = 0.0
+        self.loop_observations = []
+
+    async def observe_controller(self):
+        while True:
+            scheduled = time.monotonic() + 0.1
+            await asyncio.sleep(0.1)
+            received = time.monotonic()
+            self.loop_observations.append(
+                {
+                    "scheduled": scheduled,
+                    "received": received,
+                    "delay_s": max(0, received - scheduled),
+                }
+            )
 
     async def exec(self, sid, command, timeout=180):
         start = time.monotonic()
         try:
             r = await self.p.exec(sid, command, timeout)
+            received = time.monotonic()
             self.e.log(
                 "command",
                 id=sid,
                 command_sha256=hashlib.sha256(command.encode()).hexdigest(),
-                duration_s=time.monotonic() - start,
+                duration_s=received - start,
+                sent_monotonic=start,
+                received_monotonic=received,
                 exit_code=r.exit_code,
                 stdout=r.stdout[-2000:],
                 stderr=r.stderr[-2000:],
@@ -665,15 +703,6 @@ class Runner:
             payload["repo_path"] = disk_expected["repo_path"]
         result = await self.guest(sid, payload, 1200, timing=row)
         row["steps"] = result["steps"]
-        verification_started = time.monotonic()
-        row["external_s3"] = await self.s3.verify(
-            next(s["result"] for s in result["steps"] if s["step"] == "s3_write")
-        )
-        row["external_verification_s"] = time.monotonic() - verification_started
-        if not row["external_s3"]["passed"]:
-            row["failure_domain"] = "external_s3_verification"
-            raise RuntimeError("Independent S3 readback did not match")
-        row["full_workflow_s"] = time.monotonic() - row["t0"]
         for step in result["steps"]:
             row[step["step"] + "_ready_s"] = (
                 step["guest_monotonic"]
@@ -695,16 +724,37 @@ class Runner:
             }
             for s in result["steps"]
         }
-        row["s3_write_ready_s"] = row["full_workflow_s"]
+        verification_started = time.monotonic()
+        row["external_s3"] = await self.s3.verify(
+            next(s["result"] for s in result["steps"] if s["step"] == "s3_write")
+        )
+        row["external_verification_s"] = time.monotonic() - verification_started
+        if not row["external_s3"]["passed"]:
+            row["failure_domain"] = "external_s3_verification"
+            raise RuntimeError("Independent S3 readback did not match")
+        row["full_workflow_s"] = time.monotonic() - row["t0"]
+        row["s3_verified_s"] = row["full_workflow_s"]
         return result["state"]
 
     async def trial(
         self, case, index, ref=None, expected=None, existing=None, disk_expected=None
     ):
         row = {"case": case, "index": index, "status": "queued", "queued_at": now()}
+        if case == "fresh":
+            row["source_kind"] = "image"
+            if self.c.get("prepared") and self.c["suite"] == "workflow":
+                row["source_kind"] = (
+                    "prepared_snapshot"
+                    if self.c.get("prepared_ref")
+                    else "prepared_image"
+                )
+            row["case_label"] = "Fresh (" + row["source_kind"].replace("_", " ") + ")"
+        queued = time.monotonic()
         self.e.state["trials"].append(row)
         self.e.save_trial(row)
         async with self.slots:
+            admitted = time.monotonic()
+            row["admission_wait_s"] = admitted - queued
             # Keep source names within Beam's 24-character limit, including N=1,000.
             label = {"source-disk": "sd", "source-memory": "sm"}.get(case, case[0])
             name = f"sb-{self.run_id}-{label}-{index}"
@@ -716,6 +766,7 @@ class Runner:
 
                 async def dispatch():
                     row["t0"] = time.monotonic()
+                    row["dispatch_preparation_s"] = row["t0"] - admitted
                     try:
                         return await (
                             self.p.resume(existing)
@@ -723,7 +774,12 @@ class Runner:
                             else self.p.create(name, ref)
                         )
                     finally:
-                        row["provider_lifecycle_s"] = time.monotonic() - row["t0"]
+                        received = time.monotonic()
+                        row["provider_lifecycle_s"] = received - row["t0"]
+                        row["lifecycle_observation"] = {
+                            "sent_monotonic": row["t0"],
+                            "received_monotonic": received,
+                        }
 
                 if existing:
                     sid = await self.e.mutation(
@@ -741,6 +797,9 @@ class Runner:
                         raise RuntimeError("Fork reused its source ID")
                 row["sandbox_id"] = sid
                 self.e.save_trial(row)
+                row["post_lifecycle_recording_s"] = (
+                    time.monotonic() - row["lifecycle_observation"]["received_monotonic"]
+                )
                 await self.terminal(sid, row)
                 if self.c["suite"] == "commands":
                     # Deterministic shell/filesystem checks, separate from the
@@ -1120,6 +1179,9 @@ class Runner:
             "guest_workflow_s": "Monotonic duration on the guest workload thread; excludes SDK transport, harness deployment and outside S3 verification.",
             "harness_setup_s": "Runtime service startup, prepared image checks, cold bootstrap when requested, and saved-state observation before workload execution.",
             "full_workflow_s": "Observed end-to-end from native dispatch through independent S3 verification, including harness setup. Never adjusted by subtracting estimated overhead.",
+            "s3_write_ready_s": "Guest S3 write completion, translated to the latest edge of the terminal-probe clock-alignment interval; excludes subsequent state capture and independent verification.",
+            "s3_verified_s": "Controller observation after independent S3 readback succeeds; currently the final full-workflow milestone.",
+            "controller_observations": "Direct event-loop lateness samples at 100 ms, local evidence-write intervals, command/lifecycle send/receive times and S3 executor queue/return delays. No observed delay is subtracted from workload timings.",
             "native_waits": {
                 "beam": "Native wait=True first; when it returns a running PID, observe that same PID at 100 ms without replay; each observation is logged",
                 "tensorlake": "Blocking create; resume SDK polling at 100 ms",
@@ -1130,6 +1192,7 @@ class Runner:
             }[self.c["provider"]],
         }
         self.e.save()
+        monitor = asyncio.create_task(self.observe_controller())
         try:
             if self.c.get("prepared") and self.c["suite"] == "workflow":
                 await self.prepare_tools()
@@ -1143,9 +1206,41 @@ class Runner:
             )
             raise
         finally:
-            await self.cleanup()
-            self.e.state["finished_at"] = now()
-            self.e.save()
+            try:
+                await self.cleanup()
+            finally:
+                monitor.cancel()
+                try:
+                    await monitor
+                except asyncio.CancelledError:
+                    pass
+                self.e.state["finished_at"] = now()
+                observations = {
+                    "sample_interval_s": 0.1,
+                    "event_loop": self.loop_observations,
+                    "evidence_io": list(self.e.io_observations),
+                }
+                self.e.state["controller_observations"] = {
+                    "path": "controller-observations.json",
+                    "loop_delay_s": timing_stats(
+                        [x["delay_s"] for x in self.loop_observations]
+                    ),
+                    "evidence_io_s": timing_stats(
+                        [x["finished"] - x["started"] for x in self.e.io_observations]
+                    ),
+                }
+                self.e.write(self.e.path / "controller-observations.json", observations)
+                self.e.save()
+
+
+def timing_stats(values):
+    values = sorted(values)
+    return {
+        "n": len(values),
+        "mean": statistics.mean(values) if values else None,
+        "p95": values[math.ceil(len(values) * 0.95) - 1] if values else None,
+        "max": values[-1] if values else None,
+    }
 
 
 def summarize(state):
@@ -1156,6 +1251,7 @@ def summarize(state):
         "timing_protocol": state.get("timing_protocol"),
         "prepared_tools": state.get("prepared_tools"),
         "timing_contract": state.get("timing_contract"),
+        "controller_observations": state.get("controller_observations"),
         "cases": {},
     }
     for case in state["config"]["lifecycles"]:
@@ -1166,6 +1262,8 @@ def summarize(state):
             if r.get("full_workflow_s") is not None and r["status"] == "passed"
         )
         result["cases"][case] = {
+            "label": rows[0].get("case_label", case) if rows else case,
+            "timing_population": "successful_workflows",
             "requested": state["config"]["count"],
             "attempted": sum("t0" in r for r in rows),
             "passed": sum(r["status"] == "passed" for r in rows),
@@ -1198,6 +1296,7 @@ def summarize(state):
             "terminal_ready_s",
             "local_write_ready_s",
             "s3_write_ready_s",
+            "s3_verified_s",
             "full_workflow_s",
             "commands_s",
             "bootstrap_s",
@@ -1207,8 +1306,15 @@ def summarize(state):
             "workflow_rpc_s",
             "workflow_observation_overhead_s",
             "external_verification_s",
+            "dispatch_preparation_s",
+            "admission_wait_s",
+            "post_lifecycle_recording_s",
         ):
-            measured = sorted(r[field] for r in rows if r.get(field) is not None)
+            measured = sorted(
+                r[field]
+                for r in rows
+                if r["status"] == "passed" and r.get(field) is not None
+            )
             result["cases"][case]["timings_s"][field] = {
                 "n": len(measured),
                 "mean": statistics.mean(measured) if measured else None,

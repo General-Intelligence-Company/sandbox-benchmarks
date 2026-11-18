@@ -112,6 +112,7 @@ independently of whether the measured workflows passed.
 - `updates/`: atomic trial and operation records written during dispatch. Keep this directory with `run.json`; `report` and `cleanup` combine both when a run is active or interrupted.
 - `summary.json`: attempted, passed, failed, ineligible and unrun counts; successful workflow mean/P95; activity and cleanup coverage.
 - `events.jsonl`: command timing/outcomes and each independent S3 read attempt.
+- `controller-observations.json`: event-loop lateness samples and local evidence-write intervals, using the same controller monotonic clock as command and lifecycle observations.
 - `artifacts/`: guest logs, resource samples and browser screenshots.
 
 Readiness milestones are cumulative from the create/fork/resume dispatch. Terminal ready means a command ran. Local-disk, S3 and full-workflow readiness are separate checkpoints. Do not add their times together. Queue waiting, activity and cleanup are separate.
@@ -124,6 +125,8 @@ Workflow runs default to `prepared = true`. They install tools and stage benchma
 
 Prepared bases use each provider's native disk image/snapshot support. Blaxel uses its image builder. exe.dev uses a disk copy of a stopped tools-only source, so its prepared `fresh` case measures that creation path, not `new` from a registry image. The preparation method, reference and duration remain in `prepared_tools`; workload disk and memory forks still use separate sources containing the running app's state. All run-owned bases and source VMs are included in cleanup.
 
+Fresh rows record `source_kind` and `case_label`: `prepared_snapshot` for a prepared snapshot/copy, `prepared_image` for a prepared image, or `image` for cold image creation. These labels also appear in the summary. New workflow runs use `prepared-v2` or `cold-v2`; existing run files are never migrated or overwritten.
+
 The [prepared-image N=5 validation](docs/prepared-validation-2026-11-13.md) includes per-case timings and the preparation failures found during live execution.
 
 ### Timing fields
@@ -132,14 +135,21 @@ The [prepared-image N=5 validation](docs/prepared-validation-2026-11-13.md) incl
 | --- | --- |
 | `provider_lifecycle_s` | The native create/fork/resume call, including network transit and SDK waits. Local journal writes and tools preparation are outside this clock. This is an observed API duration, not internal provider boot time. |
 | `terminal_ready_s` | Time from native dispatch until the first successful terminal command is received. Every failed readiness probe and its send/receive bounds are recorded. |
+| `s3_write_ready_s` | Guest S3-write completion, translated to the upper edge of the clock-alignment interval. It excludes later state capture and independent readback. |
+| `s3_verified_s` | Cumulative time until the controller confirms the written bytes in S3. Currently the same final milestone as `full_workflow_s`. |
 | `harness_setup_s` | Prepared-file checks, guest-service startup and saved-state observation before the workload; cold installation when requested. |
 | `guest_workflow_s` | Monotonic execution duration measured on the guest's workload thread. It excludes the native exec transport and outside S3 verifier. |
 | `workflow_rpc_s` | Complete workload RPC observation on the controller, including native command transport and response decoding. |
 | `workflow_observation_overhead_s` | Workload RPC duration minus guest execution duration. This contains transport, command launch and queueing; it is a measured residual, not a correction subtracted from other clocks. |
 | `external_verification_s` | Independent S3 readback, including recorded retries. |
 | `full_workflow_s` | The complete observed duration from dispatch through S3 verification, including harness setup. It stays available alongside the separated measurements. |
+| `admission_wait_s` | Local wait for a trial slot, before native dispatch and outside provider/workflow clocks. |
+| `dispatch_preparation_s` | Local preparation and evidence recording after admission, before native dispatch. |
+| `post_lifecycle_recording_s` | Controller bookkeeping between the native lifecycle response and the first terminal probe. Included in cumulative readiness, outside `provider_lifecycle_s`. |
 
 `guest_milestones_s` records each step relative to guest execution start. `milestone_observation_bounds_s` brackets cumulative guest milestones using the terminal probe's send/receive times; cross-machine clock alignment is not treated as exact. Do not subtract an assumed network round trip or half a polling interval to manufacture provider-only latency.
+
+Controller observations measure event-loop lateness every 100 ms and evidence serialization/write intervals in memory, then save them after cleanup, outside measured workflows. Command events and lifecycle rows record send/receive times. Each external S3 read records executor queue time, worker duration and return-to-event-loop delay. These observations expose local contention; they are not subtracted from raw timings. The final observation-file write and final checkpoint occur after sampling ends.
 
 Providers return from creation at different states: some acknowledge a new ID while others wait for a running machine. Use `terminal_ready_s` for the common request-to-working-command comparison; do not rank provider startup by `provider_lifecycle_s` alone.
 

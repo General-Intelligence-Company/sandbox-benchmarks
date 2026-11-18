@@ -4,7 +4,7 @@
   "fixture_commit": "a9f23fbc4ccddfd43d8a72e6b4ab5d369fd102a5",
   "files": {
     ".gitignore": "acf343401a6d551be9a42c298c265a578368a8a75a2fb4722d7493fd9b7c8a26",
-    "README.md": "549797d5ae1134c50f6160532aa3a3d2e61b3d3b922068c22ed347c085d47df2",
+    "README.md": "de6dc53b60794ee70af878f4c289155fe4d034eaab0c64e29dbe686005d192b1",
     "check_source_integrity.py": "46503125abc4c2fe92250f3126ec081a66545817098345b76ed5fa6684c216e7",
     "context/bench-resource-recorder.service": "589711be9ea8668603ba214daa162af7f66aa44d2206e743596d55451c55319c",
     "context/manifest.example.json": "1961bf042f785752aecf47d327c8f130a1222a1d0dc2c74438dd582f66d3cc29",
@@ -33,11 +33,11 @@
     "image/build_tools_image.py": "62afb2fb783b3e06f9cd7b143d9e7995c8b54ec514432a38d9edb0c6654f7f3a",
     "pyproject.toml": "bdfd4e78fb2fe50c45cc430095f9a4fe4af65470d55fb75616bfd2f2deba52ba",
     "sandbox_bench/__init__.py": "7861300e148959da570cd348089880f4ddd32859b4f6b77db9441669de0ef5c3",
-    "sandbox_bench/cli.py": "3cd67f4a1991728f97fb7e5fbb1c5d1ad58dcc0a942a19af4ac3e6bcb4e428ed",
-    "sandbox_bench/providers.py": "ad95c71d3a65d50f23967625a6aa076ad2c9dc02b9e5730b2bc1890f8c54bc50",
-    "sandbox_bench/runner.py": "f22c8d943357ee3694baf8def77b75af18f09161129c1b05b08546db7d0d9a1f",
+    "sandbox_bench/cli.py": "69293a8fb8fe7cb01a7141c3cf8062cfa14191d3b3b1d95afd4b97478f5ede2a",
+    "sandbox_bench/providers.py": "baf7253d4efadba44e6be80c2c400da988854b83db958f405683979347e1289a",
+    "sandbox_bench/runner.py": "28fcae8b203cfa8d16a9d2df41b22132b1db28280fe8baf8b239d481d3846568",
     "sandbox_bench/tools.py": "bb602c86344ebef8283fd172848746695da427fc02ba99ef9e2c139b4f32864b",
-    "tests/test_portable_runner.py": "7aaa053201d9d264e91050b228f430075d54638eafe6a6da579173a473f0f72f",
+    "tests/test_portable_runner.py": "8f888645562a4b75b55f687bf2e33c19d5cbdb1e03bcc84ac604c1561b1560fa",
     "uv.lock": "f5054cad3cda393dd94d22df69a9e16ea1626aab52a5c3dadda64c1171f93bf5"
   }
 }
