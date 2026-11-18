@@ -891,35 +891,64 @@ class Runner:
             row["collection_error"] = str(exc)
         self.e.save_trial(row)
 
-    async def cleanup_ids(self, ids):
-        for sid in set(ids):
+    async def cleanup_ids(self, ids, confirm_delete=()):
+        async def remove(sid):
             record = self.e.state["owned"][sid]
-            if record.get("deleted"):
-                continue
+            earlier = [
+                o
+                for o in self.e.state["operations"]
+                if o["kind"] == "delete"
+                and o.get("id") == sid
+                and o["status"] == "unconfirmed"
+                and not o.get("reconciled_absent_at")
+            ]
+            if record.get("deleted") and not earlier:
+                return
+            started = time.monotonic()
             try:
-                if not await self.p.absent(sid):
-                    if any(
-                        o["kind"] == "delete"
-                        and o.get("id") == sid
-                        and o["status"] == "unconfirmed"
-                        for o in self.e.state["operations"]
-                    ):
-                        raise RuntimeError(
-                            "Earlier deletion outcome is unconfirmed; not replaying it"
+                async with asyncio.timeout(self.p.cleanup_timeout):
+                    await self.p.release(sid)
+                    if not await self.p.absent(sid):
+                        if earlier and sid not in confirm_delete:
+                            raise RuntimeError(
+                                "Earlier deletion outcome is unconfirmed; not replaying it"
+                            )
+                        await self.e.mutation(
+                            "delete",
+                            lambda: self.p.delete(sid),
+                            id=sid,
+                            operator_confirmed=sid in confirm_delete,
+                            prior_operation_ids=[o["operation_id"] for o in earlier],
                         )
-                    await self.e.mutation("delete", lambda: self.p.delete(sid), id=sid)
-                for _ in range(60):
-                    if await self.p.absent(sid):
-                        record.update(deleted=True, verified_at=now())
-                        break
-                    await asyncio.sleep(1)
-                if not record.get("deleted"):
-                    raise RuntimeError("Deletion was not independently confirmed")
+                    for _ in range(60):
+                        if await self.p.absent(sid):
+                            record.update(deleted=True, verified_at=now())
+                            record.pop("cleanup_error", None)
+                            for op in earlier:
+                                op["reconciled_absent_at"] = record["verified_at"]
+                                self.e.save_update("operation", op["operation_id"], op)
+                            break
+                        await asyncio.sleep(1)
+                    if not record.get("deleted"):
+                        raise RuntimeError("Deletion was not independently confirmed")
             except Exception as exc:
-                record["cleanup_error"] = str(exc)
+                record["cleanup_error"] = type(exc).__name__ + ": " + str(exc)
+            self.e.log(
+                "cleanup_vm",
+                id=sid,
+                duration_s=time.monotonic() - started,
+                deleted=record.get("deleted"),
+                error=record.get("cleanup_error"),
+            )
+
+        owned = sorted(set(ids))
+        for start in range(0, len(owned), self.p.cleanup_concurrency):
+            await asyncio.gather(
+                *(remove(sid) for sid in owned[start:start + self.p.cleanup_concurrency])
+            )
         self.e.save()
 
-    async def cleanup(self):
+    async def cleanup(self, confirm_delete=()):
         # Reconcile names after an ambiguous create before deleting known IDs.
         try:
             inventory = await self.p.inventory()
@@ -935,7 +964,7 @@ class Runner:
                     )
         except Exception as exc:
             self.e.state["reconciliation_error"] = str(exc)
-        await self.cleanup_ids(list(self.e.state["owned"]))
+        await self.cleanup_ids(list(self.e.state["owned"]), confirm_delete)
         for ref in self.e.state["snapshots"]:
             try:
                 if not await self.p.snapshot_absent(ref) and not ref.get(
@@ -968,7 +997,10 @@ class Runner:
         self.e.save()
 
     def require_confirmed_operations(self):
-        if any(o["status"] == "unconfirmed" for o in self.e.state["operations"]):
+        if any(
+            o["status"] == "unconfirmed" and not o.get("reconciled_absent_at")
+            for o in self.e.state["operations"]
+        ):
             raise RuntimeError("Unconfirmed lifecycle operation; no further dispatch")
 
     async def admit(self, additional):
@@ -1190,17 +1222,20 @@ def summarize(state):
         "snapshots": state["snapshots"],
         "s3": state.get("s3_cleanup"),
         "unconfirmed_operations": [
-            o for o in state["operations"] if o["status"] == "unconfirmed"
+            o for o in state["operations"]
+            if o["status"] == "unconfirmed" and not o.get("reconciled_absent_at")
+        ],
+        "reconciled_operations": [
+            o for o in state["operations"] if o.get("reconciled_absent_at")
         ],
     }
     return result
 
 
-def complete(report, config):
+def cleanup_complete(report):
     clean = report["cleanup"]
     return (
-        report["status"] == "finished"
-        and clean["owned"] == clean["deleted"]
+        clean["owned"] == clean["deleted"]
         and not clean["unconfirmed_operations"]
         and all(x.get("deleted") for x in clean["snapshots"])
         and (
@@ -1208,6 +1243,13 @@ def complete(report, config):
             or clean["s3"].get("remaining") == 0
             and not clean["s3"].get("errors")
         )
+    )
+
+
+def complete(report, config):
+    return (
+        report["status"] == "finished"
+        and cleanup_complete(report)
         and all(
             v["passed"] == v["requested"]
             and (config["suite"] != "workflow" or v["clean_activity"] == v["passed"])

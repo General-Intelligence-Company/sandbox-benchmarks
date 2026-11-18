@@ -82,12 +82,17 @@ class Provider:
     resume_memory = True
     native_tools_build = False
     release_snapshot_source = False
+    cleanup_concurrency = 1
+    cleanup_timeout = None
 
     def __init__(self, config):
         self.config = config
         self.handles: dict[str, Any] = {}
 
     async def close(self):
+        pass
+
+    async def release(self, sid):
         pass
 
     async def prepare(self):
@@ -132,6 +137,8 @@ class Provider:
 
 class Tensorlake(Provider):
     release_snapshot_source = True
+    cleanup_concurrency = 16
+    cleanup_timeout = 90
 
     def __init__(self, config):
         super().__init__(config)
@@ -140,6 +147,16 @@ class Tensorlake(Provider):
         self.client = AsyncSandboxClient(
             api_key=os.environ["TENSORLAKE_API_KEY"], max_retries=0, request_timeout=180
         )
+
+    async def release(self, sid):
+        handle = self.handles.pop(sid, None)
+        if handle is not None:
+            handle.close()
+
+    async def close(self):
+        for sid in list(self.handles):
+            await self.release(sid)
+        await self.client.close()
 
     async def check_capacity(self, additional):
         reserve = self.config.get("customer_headroom", 0)
@@ -227,10 +244,10 @@ class Tensorlake(Provider):
 
     async def pause(self, sid):
         await self.client.suspend(sid, timeout=180, poll_interval=1)
+        await self.release(sid)
 
     async def resume(self, sid):
         await self.client.resume(sid, timeout=180, poll_interval=0.1)
-        self.handles.pop(sid, None)
         return sid
 
     async def snapshot(self, sid, kind, name):
