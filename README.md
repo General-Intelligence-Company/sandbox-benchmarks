@@ -38,6 +38,18 @@ sandbox-bench run --config blaxel.toml
 
 Boat and exe.dev need no SDK extra. `sandbox-bench providers` lists credentials and the exact cases supported by each adapter. See [provider setup](docs/providers.md) for image requirements, permissions, preview access and cleanup limitations. No Doppler account or company-specific infrastructure is required.
 
+For a Tensorlake retest in batches of 500 within a 1,000-sandbox organization limit,
+set `batch_size = 500`, `customer_headroom = 500`, and
+`organization_sandbox_limit = 1000` at the top level of the config. This opt-in
+admission check requires the authenticated Tensorlake `tl` CLI on `PATH`, using
+the same `TENSORLAKE_API_KEY`. It reads organization-wide running usage before
+preparation and each new batch, outside measured timings. Insufficient capacity
+stops dispatch and keeps unrun cases visible; it does not raise quotas or replay
+cases. Tensorlake's completed snapshots outlive their sources, so tools and
+workload source VMs are deleted and their absence confirmed before each measured
+batch. Preparation sources therefore do not add to the 500 resident benchmark VMs.
+Same-ID pause/resumes use the configured bounded concurrency.
+
 ## Run the full workload
 
 Set `suite = "workflow"` in your config and fill in its `[s3]` section. Use an existing disposable test bucket, an existing seed object and a temporary AWS role profile. The controller verifies the AWS account before any test writes. That role needs to list the configured prefix, read the seed, and read/write/delete the run's objects. Provider control-plane keys never enter the guest.

@@ -2,8 +2,10 @@
 
 import asyncio
 import base64
+import json
 import os
 import shlex
+import subprocess
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -79,6 +81,7 @@ class Provider:
 
     resume_memory = True
     native_tools_build = False
+    release_snapshot_source = False
 
     def __init__(self, config):
         self.config = config
@@ -89,6 +92,9 @@ class Provider:
 
     async def prepare(self):
         """Optional image build before measured VM creation."""
+        return None
+
+    async def check_capacity(self, additional):
         return None
 
     async def tools_snapshot(self, sid, name):
@@ -125,6 +131,8 @@ class Provider:
 
 
 class Tensorlake(Provider):
+    release_snapshot_source = True
+
     def __init__(self, config):
         super().__init__(config)
         from tensorlake.sandbox import AsyncSandboxClient
@@ -132,6 +140,26 @@ class Tensorlake(Provider):
         self.client = AsyncSandboxClient(
             api_key=os.environ["TENSORLAKE_API_KEY"], max_retries=0, request_timeout=180
         )
+
+    async def check_capacity(self, additional):
+        reserve = self.config.get("customer_headroom", 0)
+        if not reserve:
+            return None
+        process = await asyncio.to_thread(
+            subprocess.run, ["tl", "usage", "--output", "json"],
+            capture_output=True, text=True, timeout=30, check=True,
+        )
+        running = json.loads(process.stdout)["runningSandboxes"]
+        if type(running) is not int or running < 0:
+            raise ProviderError("Tensorlake usage returned an invalid running count")
+        limit = self.config["organization_sandbox_limit"]
+        return {
+            "running_sandboxes": running,
+            "additional_sandboxes": additional,
+            "organization_sandbox_limit": limit,
+            "customer_headroom": reserve,
+            "admitted": additional <= limit - reserve and running + additional <= limit,
+        }
 
     async def create(self, name, ref=None):
         ref = ref or self.config.get("prepared_ref")

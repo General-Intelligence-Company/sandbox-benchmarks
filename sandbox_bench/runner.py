@@ -488,6 +488,7 @@ class Runner:
         self.e.state["trials"].append(row)
         self.e.save()
         try:
+            await self.admit(1)
             if self.p.native_tools_build:
                 ref = {"id": name, "image_name": name, "kind": "image", "role": "tools"}
                 self.e.state["snapshots"].append(ref)
@@ -529,6 +530,10 @@ class Runner:
             else:
                 self.c["prepared_ref"] = ref
                 self.e.state["snapshots"].append(ref)
+            if self.p.release_snapshot_source:
+                await self.cleanup_ids([sid])
+                if not self.e.state["owned"][sid].get("deleted"):
+                    raise RuntimeError("Tools source deletion not confirmed; dispatch held")
             row["status"] = "passed"
             self.e.state["prepared_tools"] = {
                 "reference": ref,
@@ -966,6 +971,43 @@ class Runner:
         if any(o["status"] == "unconfirmed" for o in self.e.state["operations"]):
             raise RuntimeError("Unconfirmed lifecycle operation; no further dispatch")
 
+    async def admit(self, additional):
+        capacity = await self.p.check_capacity(additional)
+        if capacity is not None:
+            self.e.log("capacity_admission", **capacity)
+            if not capacity["admitted"]:
+                raise RuntimeError("Insufficient organization capacity for this batch; dispatch held")
+
+    async def resume_trial(self, row):
+        try:
+            if row["status"] != "passed":
+                raise RuntimeError("Fresh workload did not pass")
+            sid = row["sandbox_id"]
+            async with self.slots:
+                preserved = (
+                    (await self.guest(sid, {"op": "state"}))["state"]
+                    if self.p.resume_memory
+                    else None
+                )
+                await self.e.mutation("pause", lambda: self.p.pause(sid), id=sid)
+            return await self.trial(
+                "resume",
+                row["index"],
+                expected=preserved,
+                existing=sid,
+                disk_expected=row["saved_state"],
+            )
+        except Exception as exc:
+            result = {
+                "case": "resume",
+                "index": row["index"],
+                "status": "ineligible",
+                "error": str(exc),
+            }
+            self.e.state["trials"].append(result)
+            self.e.save_trial(result)
+            return None
+
     async def phase(self, case):
         self.require_confirmed_operations()
         if self.s3:
@@ -973,6 +1015,7 @@ class Runner:
         ref, expected = None, None
         source_ids = []
         if case in ("disk", "memory"):
+            await self.admit(1)
             source = await self.trial("source-" + case, 0)
             if source["status"] != "passed":
                 raise RuntimeError("Snapshot source workload failed")
@@ -1000,6 +1043,10 @@ class Runner:
             ref.update(source_id=sid, disk_expected=source["saved_state"])
             self.e.state["snapshots"].append(ref)
             self.e.save()
+            if self.p.release_snapshot_source:
+                await self.cleanup_ids(source_ids)
+                if not self.e.state["owned"][sid].get("deleted"):
+                    raise RuntimeError("Snapshot source deletion not confirmed; dispatch held")
         for start in range(1, self.c["count"] + 1, self.c["batch_size"]):
             if self.s3:
                 self.s3.ensure_valid()
@@ -1007,52 +1054,15 @@ class Runner:
             indices = range(
                 start, min(start + self.c["batch_size"], self.c["count"] + 1)
             )
+            await self.admit(len(indices))
             rows = await asyncio.gather(
                 *(self.trial(case, i, ref, expected) for i in indices)
             )
             await self.activity(rows)
             await asyncio.gather(*(self.artifact(r) for r in rows))
             if case == "fresh" and "resume" in self.c["lifecycles"]:
-                resumed = []
-                for row in rows:
-                    if row["status"] != "passed":
-                        self.e.state["trials"].append(
-                            {
-                                "case": "resume",
-                                "index": row["index"],
-                                "status": "ineligible",
-                                "error": "Fresh workload did not pass",
-                            }
-                        )
-                        continue
-                    sid = row["sandbox_id"]
-                    try:
-                        preserved = (
-                            (await self.guest(sid, {"op": "state"}))["state"]
-                            if self.p.resume_memory
-                            else None
-                        )
-                        await self.e.mutation(
-                            "pause", lambda: self.p.pause(sid), id=sid
-                        )
-                        resumed.append(
-                            await self.trial(
-                                "resume",
-                                row["index"],
-                                expected=preserved,
-                                existing=sid,
-                                disk_expected=row["saved_state"],
-                            )
-                        )
-                    except Exception as exc:
-                        self.e.state["trials"].append(
-                            {
-                                "case": "resume",
-                                "index": row["index"],
-                                "status": "ineligible",
-                                "error": str(exc),
-                            }
-                        )
+                resumed = await asyncio.gather(*(self.resume_trial(row) for row in rows))
+                resumed = [row for row in resumed if row is not None]
                 await self.activity(resumed)
                 await asyncio.gather(*(self.artifact(r) for r in resumed))
             await self.cleanup_ids(
