@@ -70,10 +70,20 @@ class Evidence:
         ]
 
     def clean(self, value):
-        text = json.dumps(value, default=str)
-        for secret in self.secrets:
-            text = text.replace(secret, "[redacted]")
-        return re.sub(r'(https?://[^\s"?]+)\?[^\s"]+', r"\1?[redacted]", text)
+        def redact(value):
+            if isinstance(value, str):
+                for secret in self.secrets:
+                    value = value.replace(secret, "[redacted]")
+                return re.sub(
+                    r'(https?://[^\s"?]+)\?[^\s"]+', r"\1?[redacted]", value
+                )
+            if isinstance(value, dict):
+                return {redact(k): redact(v) for k, v in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [redact(v) for v in value]
+            return value
+
+        return json.dumps(redact(value), default=lambda value: redact(str(value)))
 
     @staticmethod
     def read_state(path):
