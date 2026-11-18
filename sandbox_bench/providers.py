@@ -8,6 +8,7 @@ import shlex
 import subprocess
 import time
 from dataclasses import dataclass, field
+from pathlib import PurePosixPath
 from typing import Any
 from urllib.parse import quote
 
@@ -487,7 +488,8 @@ class Blaxel(Provider):
                 "name": "bench-service-" + str(time.time_ns()),
                 "command": "$(command -v sudo || true) bash -lc "
                 + shlex.quote(
-                    "exec " + command + " >> " + shlex.quote(log_path) + " 2>&1"
+                    "mkdir -p " + shlex.quote(str(PurePosixPath(log_path).parent))
+                    + " && exec " + command + " >> " + shlex.quote(log_path) + " 2>&1"
                 ),
                 "wait_for_completion": False,
                 "keep_alive": True,

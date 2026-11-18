@@ -34,7 +34,7 @@
     "pyproject.toml": "bdfd4e78fb2fe50c45cc430095f9a4fe4af65470d55fb75616bfd2f2deba52ba",
     "sandbox_bench/__init__.py": "7861300e148959da570cd348089880f4ddd32859b4f6b77db9441669de0ef5c3",
     "sandbox_bench/cli.py": "69293a8fb8fe7cb01a7141c3cf8062cfa14191d3b3b1d95afd4b97478f5ede2a",
-    "sandbox_bench/providers.py": "baf7253d4efadba44e6be80c2c400da988854b83db958f405683979347e1289a",
+    "sandbox_bench/providers.py": "bff25f92f71d0b1b2c3950551c81669116b53a1154ab08f18197b975a68ee8d1",
     "sandbox_bench/runner.py": "53ea7692f7344bf8e547807575e9809943dbd7579dc27775248c2564ae7a03c5",
     "sandbox_bench/tools.py": "bb602c86344ebef8283fd172848746695da427fc02ba99ef9e2c139b4f32864b",
     "tests/test_portable_runner.py": "8f888645562a4b75b55f687bf2e33c19d5cbdb1e03bcc84ac604c1561b1560fa",
