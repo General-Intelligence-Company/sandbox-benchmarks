@@ -119,7 +119,9 @@ Readiness milestones are cumulative from the create/fork/resume dispatch. Termin
 
 Dispatch writes only the changed record. Full history checkpoints happen outside measured workflows, so evidence from earlier batches does not delay later launches.
 
-Activity windows start after a lead based on observed guest-control round trips. This setup wait is separate from workflow timing and the 60-second window. Each guest records when it was armed; late starts and checks remain failures.
+Activity windows use one future controller-monotonic start, translated through a fresh clock sample from each guest. Request/response times bound the clock offset without assuming symmetric network latency. The guest schedules against its monotonic clock, so a restored wall clock cannot trigger catch-up bursts. Late arm acknowledgements, clock discontinuities and alignment uncertainty above one second cannot pass. Scoring uses the latest possible event time within the clock bounds. The lead, calibration and collection stay outside workflow timing; late checks remain failures.
+
+`activity_protocol = "monotonic-interval-v1"` identifies this activity scoring. Native lifecycle and workflow timing definitions remain unchanged. `activity_functional`, `activity_cadence_miss`, `activity_unarmed`, `activity_unobserved` and `activity_unknown` explain the strict `clean_activity` count without relaxing it. Control traffic is paced separately from measured lifecycle and terminal calls. Only read-only requests are retried, within an overall deadline; an ambiguous activity arm or lifecycle mutation is never replayed.
 
 Workflow runs default to `prepared = true`. They install tools and stage benchmark files once in a separate preparation sandbox, then create a prepared base before dispatching measured cases. A measured case verifies the staged file hashes and fails if the prepared files are missing; it never silently installs tools. Set `prepared = false` to measure the cold-install protocol instead. Keep the protocols separate when comparing results.
 
@@ -166,6 +168,8 @@ A missed activity check is not proof of a crashed VM. The report separates guest
 Cleanup acts only on IDs created by this run, exact names from its create intents, and its generated S3 subprefix. It independently checks VM deletion. A second controller cannot lock the same run directory. There is no `resume` command that might repeat an ambiguous create or fork.
 
 Keep the run directory after an interruption. `cleanup` can reconcile named resources and remove known IDs without starting a replacement cohort. Lost snapshot responses, incomplete provider inventories and SDK deletion limitations remain visible; the tool does not call those fully reconciled. Modal memory snapshots must expire under the provider's retention policy. Cached base images are not removed.
+
+Evidence export gets at most three attempts within 120 seconds. Interruption also allows a bounded final collection attempt before cleanup. Missing archives are recorded explicitly and do not keep billable VMs alive indefinitely. Do not manually delete run-owned VMs before checking archive coverage or attempting rescue. S3 cleanup waits until owned writers are confirmed absent. Asynchronous snapshot deletion is polled without resubmitting it; Modal memory snapshots remain `provider_expiry_pending` with an expected expiry bound, never falsely marked deleted.
 
 Outputs can contain app files and environment-specific metadata. Review them before sharing. Keys and signed URLs are redacted from JSON logs, and provider keys are never copied into the guest.
 

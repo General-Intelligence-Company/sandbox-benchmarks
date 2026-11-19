@@ -768,16 +768,26 @@ class Runner:
     async def run_activity_window(self, trials, label, cycles=12, duration=60):
         good = [p for p in trials if p[0] and p[1].get("setup_passed")]
         start = time.time() + (20 if duration == 60 else 3)
+        start_mono = time.monotonic() + (20 if duration == 60 else 3)
         end = start + duration
 
         async def schedule(pair):
             sandbox, trial = pair
             try:
+                sent = time.monotonic()
+                clock = await self.request_guest(sandbox, {"op": "progress"}, trial, 30)
+                received = time.monotonic()
+                lower = sent - clock["guest_monotonic"]
+                upper = received - clock["guest_monotonic"]
+                if (upper - lower) / 2 > 1:
+                    raise RuntimeError("Activity clock alignment is too uncertain")
+                trial["activity_clock_bounds"] = [lower, upper]
                 await self.request_guest(
                     sandbox,
                     {
                         "op": "activity",
                         "epoch": start,
+                        "start_monotonic": start_mono - (lower + upper) / 2,
                         "duration": duration,
                         "cycles": cycles,
                     },
@@ -785,6 +795,7 @@ class Runner:
                     30,
                 )
                 trial["activity_schedule_ack_epoch"] = time.time()
+                trial["activity_alignment_confirmed"] = time.monotonic() <= start_mono
             except Exception as e:
                 trial["activity_error"] = self.redact_secrets(e)
 
@@ -832,11 +843,15 @@ class Runner:
                 events = trial["activity"]
                 trial["activity_passed"] = (
                     trial.get("activity_done", False)
+                    and trial.get("activity_alignment_confirmed", False)
                     and len(events) == cycles
                     and all(
                         e.get("passed")
                         and e.get("external", {}).get("passed")
-                        and start <= datetime.fromisoformat(e["at"]).timestamp() < end
+                        and e["started_monotonic"] + trial["activity_clock_bounds"][1]
+                        <= start_mono + 5 * e["index"] + 1
+                        and e["guest_monotonic"] + trial["activity_clock_bounds"][1]
+                        <= start_mono + duration
                         for e in events
                     )
                 )

@@ -215,6 +215,7 @@ async def execute(args):
                 "run_id": run_id,
                 "created_at": now(),
                 "status": "prepared",
+                "activity_protocol": "monotonic-interval-v1",
                 "timing_protocol": ("prepared-v2" if c["prepared"] else "cold-v2")
                 if c["suite"] == "workflow"
                 else "commands-v1",

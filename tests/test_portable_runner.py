@@ -283,6 +283,7 @@ async def test_deletion_acknowledgement_is_not_cleanup_proof(tmp_path, monkeypat
 
     c = config(tmp_path)
     e, p = evidence(tmp_path, c), FakeProvider(acknowledge_only=True)
+    p.cleanup_timeout = 0.01
     p.active["owned"] = {"id": "owned", "name": "owned"}
     e.state["owned"]["owned"] = {"deleted": False}
 
@@ -317,6 +318,7 @@ async def test_boat_stop_polls_state_without_replaying_stop(tmp_path, monkeypatc
 async def test_cleanup_does_not_replay_unconfirmed_delete(tmp_path):
     c = config(tmp_path)
     e, p = evidence(tmp_path, c), FakeProvider()
+    p.cleanup_timeout = 0.01
     p.active["owned"] = {"id": "owned", "name": "owned"}
     e.state["owned"]["owned"] = {"deleted": False}
     e.state["operations"] = [{"kind": "delete", "id": "owned", "status": "unconfirmed"}]
@@ -425,46 +427,28 @@ async def test_cancelled_trial_is_visible_and_its_vm_is_cleaned(tmp_path):
     assert summarize(e.state)["cases"]["fresh"]["interrupted"] == 1
 
 
-async def test_activity_drains_late_final_check_without_turning_it_into_a_pass(
-    tmp_path, monkeypatch
-):
-    from sandbox_bench import runner
-    from datetime import datetime, timezone
+def test_activity_drains_late_final_check_without_turning_it_into_a_pass():
+    from sandbox_bench.activity import ClockAlignment, score_activity
 
-    c = config(tmp_path, suite="workflow")
-    e = evidence(tmp_path, c)
-    r = Runner(c, FakeProvider(), e, SimpleNamespace(verify=None))
-    calls = []
     events = [
         {
+            "index": i,
             "passed": True,
-            "s3_write": {},
             "external_s3": {"passed": True},
-            "start_lateness_s": 0,
-            "at": datetime.fromtimestamp(1006 + i * 5, timezone.utc).isoformat(),
+            "started_monotonic": 100 + 5 * i,
+            "guest_monotonic": 100.5 + 5 * i,
         }
         for i in range(12)
     ]
-    events[-1]["at"] = datetime.fromtimestamp(1070, timezone.utc).isoformat()
-
-    async def guest(sid, payload, timeout=600):
-        calls.append(payload["op"])
-        if payload["op"] == "activity":
-            return {"scheduled_at": 1000}
-        done = calls.count("progress") > 1
-        return {"activity": {"events": events if done else events[:-1], "done": done}}
-
-    async def sleep(_):
-        return
-
-    monkeypatch.setattr(runner.time, "time", lambda: 1000)
-    monkeypatch.setattr(runner.asyncio, "sleep", sleep)
-    r.guest = guest
-    row = {"status": "passed", "sandbox_id": "vm"}
-    await r.activity([row])
-    assert calls == ["activity", "progress", "progress"]
-    assert len(row["activity"]["events"]) == 12
-    assert row["activity"]["done"] and not row["activity"]["passed"]
+    events[-1]["guest_monotonic"] = 170
+    value = {"events": events, "done": True}
+    result = score_activity(
+        value,
+        {"start_monotonic": 1100, "epoch": 1000, "alignment_confirmed": True},
+        ClockAlignment(1000, 1000),
+    )
+    assert len(result["events"]) == 12
+    assert result["done"] and result["functional"] and not result["passed"]
 
 
 @pytest.mark.parametrize(

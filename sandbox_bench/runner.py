@@ -18,7 +18,11 @@ import uuid
 from datetime import datetime, timezone
 from importlib.metadata import distribution
 from pathlib import Path
+from email.utils import parsedate_to_datetime
 
+import httpx
+
+from .activity import ClockAlignment, activity_category, score_activity
 from .providers import ProviderError
 from .tools import INSTALL
 
@@ -376,6 +380,79 @@ class Runner:
         self.run_id = self.e.state["run_id"]
         self.guest_round_trip_s = 0.0
         self.loop_observations = []
+        self.control_slots = asyncio.Semaphore(provider.control_concurrency)
+        self.next_control_request = 0.0
+
+    @staticmethod
+    def retryable_control_error(exc):
+        return http_status(exc) in (429, 500, 502, 503, 504) or isinstance(
+            exc, (TimeoutError, httpx.TransportError, ConnectionError)
+        )
+
+    async def control(
+        self, fn, deadline, *, retry=True, call_timeout=30, max_attempts=None
+    ):
+        """Pace unmeasured control traffic; only repeat explicitly read-only calls."""
+        delay = 0.5
+        attempts = 0
+        while True:
+            try:
+                async with asyncio.timeout_at(deadline):
+                    async with self.control_slots:
+                        # Reservations run without an await, so concurrent tasks
+                        # cannot reserve the same request time on this event loop.
+                        at = max(time.monotonic(), self.next_control_request)
+                        self.next_control_request = (
+                            at + 1 / self.p.control_requests_per_second
+                        )
+                        await asyncio.sleep(max(0, at - time.monotonic()))
+                        remaining = deadline - time.monotonic()
+                        attempts += 1
+                        async with asyncio.timeout(min(call_timeout, remaining)):
+                            return await fn(min(call_timeout, remaining))
+            except Exception as exc:
+                if (
+                    not retry
+                    or not self.retryable_control_error(exc)
+                    or time.monotonic() >= deadline
+                    or max_attempts is not None
+                    and attempts >= max_attempts
+                ):
+                    raise
+                retry_after = getattr(exc, "retry_after", None)
+                response = getattr(exc, "response", None)
+                if response is not None:
+                    retry_after = response.headers.get("Retry-After", retry_after)
+                wait = delay
+                if retry_after:
+                    try:
+                        wait = max(wait, float(retry_after))
+                    except ValueError:
+                        wait = max(
+                            wait,
+                            parsedate_to_datetime(retry_after).timestamp()
+                            - time.time(),
+                        )
+                self.e.log(
+                    "control_retry",
+                    error_type=type(exc).__name__,
+                    status=http_status(exc),
+                    wait_s=wait,
+                )
+                if http_status(exc) == 429:
+                    self.next_control_request = max(
+                        self.next_control_request, time.monotonic() + wait
+                    )
+                await asyncio.sleep(min(wait, max(0, deadline - time.monotonic())))
+                delay = min(4, delay * 2)
+
+    async def control_guest(self, sid, payload, deadline, *, retry=True):
+        async def call(timeout):
+            sent = time.monotonic()
+            value = await self.guest(sid, payload, timeout)
+            return value, sent, time.monotonic()
+
+        return await self.control(call, deadline, retry=retry)
 
     async def observe_controller(self):
         while True:
@@ -418,6 +495,8 @@ class Runner:
                 id=sid,
                 duration_s=time.monotonic() - start,
                 error=str(exc),
+                error_type=type(exc).__name__,
+                status=http_status(exc),
             )
             raise
 
@@ -461,8 +540,10 @@ class Runner:
                 row.setdefault("readiness_errors", []).append(
                     {"at": now(), "error": str(exc), "delay_s": delay}
                 )
-                if http_status(exc) in (401, 403, 429) or isinstance(
-                    exc, json.JSONDecodeError
+                if (
+                    getattr(exc, "terminal", False)
+                    or http_status(exc) in (401, 403, 429)
+                    or isinstance(exc, json.JSONDecodeError)
                 ):
                     raise
                 await asyncio.sleep(min(delay, max(0, deadline - time.monotonic())))
@@ -850,6 +931,8 @@ class Runner:
                     row["guest_failure"] = exc.result
                     row["steps"] = exc.result.get("steps", [])
                     row["failure_domain"] = "guest_workload"
+                if getattr(exc, "domain", None):
+                    row["failure_domain"] = exc.domain
                 row.setdefault("failure_domain", "unknown")
             finally:
                 row["duration_s"] = time.monotonic() - row["t0"]
@@ -860,167 +943,321 @@ class Runner:
         if self.c["suite"] != "workflow":
             return
         ready = [r for r in rows if r["status"] == "passed"]
-        # Leave time for the native-exec transport to arm every guest. A fixed
-        # five-second lead can expire before slow control requests even arrive.
-        lead = max(5, len(ready) * 0.25, 2 * self.guest_round_trip_s + 5)
-        epoch = time.time() + lead
+        alignments = {}
 
-        async def schedule(row):
+        async def calibrate(row):
             try:
-                receipt = await self.guest(
-                    row["sandbox_id"],
-                    {"op": "activity", "epoch": epoch, "cycles": 12, "duration": 60},
+                value, sent, received = await self.control_guest(
+                    row["sandbox_id"], {"op": "progress"}, time.monotonic() + 180
                 )
-                row["activity_schedule"] = {
-                    "lead_s": lead,
-                    "armed_at": receipt["scheduled_at"],
-                    "epoch": epoch,
+                alignment = ClockAlignment.sample(
+                    sent, received, value["guest_monotonic"]
+                )
+                if alignment.uncertainty_s > 1:
+                    raise RuntimeError(
+                        "Activity clock uncertainty exceeds the one-second cadence tolerance"
+                    )
+                alignments[row["sandbox_id"]] = alignment
+                row["activity_clock"] = {
+                    "controller_sent": sent,
+                    "controller_received": received,
+                    "guest_monotonic": value["guest_monotonic"],
+                    "offset_lower_s": alignment.lower,
+                    "offset_upper_s": alignment.upper,
                 }
             except Exception as exc:
                 row["activity"] = {
                     "passed": False,
-                    "error": str(exc),
+                    "armed": False,
+                    "observed": False,
+                    "error": type(exc).__name__ + ": " + str(exc),
                     "failure_domain": "harness_control",
                 }
 
-        await asyncio.gather(*(schedule(r) for r in ready))
+        await asyncio.gather(*(calibrate(r) for r in ready))
+        ready = [r for r in ready if r["sandbox_id"] in alignments]
         if not ready:
+            self.e.save()
             return
-        await asyncio.sleep(max(0, epoch + 60 - time.time()))
+        max_rtt = max(2 * a.uncertainty_s for a in alignments.values())
+        lead = max(
+            5,
+            len(ready) / self.p.control_requests_per_second
+            + math.ceil(len(ready) / self.p.control_concurrency) * max_rtt
+            + 2,
+        )
+        start = time.monotonic() + lead
+        epoch = time.time() + lead
+
+        async def schedule(row):
+            sid = row["sandbox_id"]
+            alignment = alignments[sid]
+            row["activity_schedule"] = {
+                "lead_s": lead,
+                "epoch": epoch,
+                "start_monotonic": start,
+                "guest_start_monotonic": alignment.guest_at(start),
+                "alignment_confirmed": False,
+            }
+            try:
+                receipt, sent, received = await self.control_guest(
+                    sid,
+                    {
+                        "op": "activity",
+                        "epoch": epoch,
+                        "start_monotonic": alignment.guest_at(start),
+                        "cycles": 12,
+                        "duration": 60,
+                    },
+                    start + 30,
+                    retry=False,
+                )
+                alignment = alignment.intersect(
+                    ClockAlignment.sample(sent, received, receipt["guest_monotonic"])
+                )
+                alignments[sid] = alignment
+                row["activity_schedule"].update(
+                    armed_at=receipt["scheduled_at"],
+                    arm_received_monotonic=received,
+                    arm_rtt_s=received - sent,
+                    alignment_uncertainty_s=alignment.uncertainty_s,
+                    alignment_confirmed=received <= start
+                    and alignment.uncertainty_s <= 1,
+                )
+            except Exception as exc:
+                # An arm is stateful. Its outcome is unknown on transport failure;
+                # never submit it again. A read may still recover guest evidence.
+                row["activity_schedule"]["arm_error"] = (
+                    type(exc).__name__ + ": " + str(exc)
+                )
+
+        await asyncio.gather(*(schedule(r) for r in ready))
+        await asyncio.sleep(max(0, start + 60 - time.monotonic()))
+        deadline = time.monotonic() + 180
 
         async def collect(row):
-            if "activity" in row:
-                return
+            value = None
+            error = None
+            drain_started = time.monotonic()
             try:
-                drain_started = time.monotonic()
-                deadline = drain_started + 180
-                value = (await self.guest(row["sandbox_id"], {"op": "progress"}))[
-                    "activity"
-                ]
-                while not value["done"] and time.monotonic() < deadline:
-                    await asyncio.sleep(0.5)
-                    value = (
-                        await self.guest(
-                            row["sandbox_id"],
-                            {"op": "progress"},
-                            min(30, max(1, deadline - time.monotonic())),
+                delay = 0.5
+                async with asyncio.timeout_at(deadline):
+                    while True:
+                        result, sent, received = await self.control_guest(
+                            row["sandbox_id"], {"op": "progress"}, deadline
                         )
-                    )["activity"]
-                events = value["events"]
-                for event in events:
-                    if event.get("s3_write"):
-                        event["external_s3"] = await self.s3.verify(event["s3_write"])
-                row["activity"] = {
-                    "passed": bool(value["done"])
-                    and len(events) == 12
-                    and all(
-                        e.get("passed")
-                        and e.get("external_s3", {}).get("passed")
-                        and e["start_lateness_s"] <= 1
-                        and datetime.fromisoformat(e["at"]).timestamp() <= epoch + 61
-                        for e in events
-                    ),
-                    "window_start": epoch,
-                    "window_end": epoch + 60,
-                    "drain_wait_s": time.monotonic() - drain_started,
-                    "events": events,
-                    "done": value["done"],
-                }
-                if (
-                    not row["activity"]["passed"]
-                    and row["activity_schedule"]["armed_at"] > epoch + 1
-                ):
-                    row["activity"]["failure_domain"] = "harness_control"
+                        value = result["activity"]
+                        if value is None:
+                            break
+                        # Confirm that the monotonic clock has not reset since arm.
+                        alignments[row["sandbox_id"]] = alignments[
+                            row["sandbox_id"]
+                        ].intersect(
+                            ClockAlignment.sample(
+                                sent, received, result["guest_monotonic"]
+                            )
+                        )
+                        if value["done"]:
+                            break
+                        await asyncio.sleep(
+                            min(delay, max(0, deadline - time.monotonic()))
+                        )
+                        delay = min(4, delay * 2)
+                    if value is not None:
+                        for event in value["events"]:
+                            if event.get("s3_write"):
+                                event["external_s3"] = await self.s3.verify(
+                                    event["s3_write"]
+                                )
             except Exception as exc:
+                error = type(exc).__name__ + ": " + str(exc)
+            schedule = row["activity_schedule"]
+            if value is None:
                 row["activity"] = {
                     "passed": False,
-                    "error": str(exc),
-                    "failure_domain": "unknown",
+                    "armed": False if error is None else None,
+                    "observed": error is None,
+                    "events": [],
+                    "done": False,
                 }
+            else:
+                # A failed read or inconsistent clock invalidates scoring, while
+                # preserving every event recovered before the error.
+                schedule["alignment_confirmed"] &= error is None
+                row["activity"] = score_activity(
+                    value, schedule, alignments[row["sandbox_id"]]
+                )
+                if error is not None:
+                    row["activity"]["observed"] = False
+            row["activity"]["drain_wait_s"] = time.monotonic() - drain_started
+            if error or schedule.get("arm_error"):
+                row["activity"].update(
+                    error=error or schedule["arm_error"],
+                    failure_domain="harness_control",
+                )
+            self.e.save_trial(row)
 
         await asyncio.gather(*(collect(r) for r in ready))
         self.e.save()
 
-    async def artifact(self, row):
-        if self.c["suite"] != "workflow" or not row.get("sandbox_id"):
+    async def artifact(self, row, deadline=None):
+        if (
+            self.c["suite"] != "workflow"
+            or not row.get("sandbox_id")
+            or row.get("artifact")
+        ):
             return
+        deadline = min(deadline or float("inf"), time.monotonic() + 120)
+        code = (
+            "import io,zipfile,base64;from pathlib import Path;b=io.BytesIO();z=zipfile.ZipFile(b,'w',zipfile.ZIP_DEFLATED);"
+            "[(z.write(p,str(Path(base.name)/p.relative_to(base)))) for base in [Path('/workspace/bench-evidence'),Path('/var/log/bench')] for p in base.rglob('*') if p.is_file()];z.close();print(base64.b64encode(b.getvalue()).decode())"
+        )
         try:
-            code = (
-                "import io,zipfile,base64;from pathlib import Path;b=io.BytesIO();z=zipfile.ZipFile(b,'w',zipfile.ZIP_DEFLATED);"
-                "[(z.write(p,str(Path(base.name)/p.relative_to(base)))) for base in [Path('/workspace/bench-evidence'),Path('/var/log/bench')] for p in base.rglob('*') if p.is_file()];z.close();print(base64.b64encode(b.getvalue()).decode())"
-            )
-            data = await self.exec(
-                row["sandbox_id"], "$(command -v sudo || true) " + python(code), 120
+            data = await self.control(
+                lambda timeout: self.exec(
+                    row["sandbox_id"],
+                    "$(command -v sudo || true) " + python(code),
+                    timeout,
+                ),
+                deadline,
+                call_timeout=120,
+                max_attempts=3,
             )
             path = self.e.path / "artifacts" / f"{row['case']}-{row['index']}.zip"
             path.parent.mkdir(exist_ok=True)
-            path.write_bytes(base64.b64decode(data))
+            path.write_bytes(base64.b64decode(data, validate=True))
             row["artifact"] = str(path.relative_to(self.e.path))
+            row.pop("collection_error", None)
+            row.pop("archive_missing_at_delete", None)
         except Exception as exc:
-            row["collection_error"] = str(exc)
-        self.e.save_trial(row)
+            row["collection_error"] = type(exc).__name__ + ": " + str(exc)
+
+        finally:
+            if not row.get("artifact"):
+                row["archive_missing_at_delete"] = True
+            self.e.save_trial(row)
 
     async def cleanup_ids(self, ids, confirm_delete=()):
-        async def remove(sid):
-            record = self.e.state["owned"][sid]
-            earlier = [
-                o
-                for o in self.e.state["operations"]
-                if o["kind"] == "delete"
-                and o.get("id") == sid
-                and o["status"] == "unconfirmed"
-                and not o.get("reconciled_absent_at")
-            ]
-            if record.get("deleted") and not earlier:
-                return
-            started = time.monotonic()
-            try:
-                async with asyncio.timeout(self.p.cleanup_timeout):
-                    await self.p.release(sid)
-                    if not await self.p.absent(sid):
-                        if earlier and sid not in confirm_delete:
-                            raise RuntimeError(
-                                "Earlier deletion outcome is unconfirmed; not replaying it"
-                            )
-                        await self.e.mutation(
-                            "delete",
-                            lambda: self.p.delete(sid),
-                            id=sid,
-                            operator_confirmed=sid in confirm_delete,
-                            prior_operation_ids=[o["operation_id"] for o in earlier],
-                        )
-                    for _ in range(60):
-                        if await self.p.absent(sid):
-                            record.update(deleted=True, verified_at=now())
-                            record.pop("cleanup_error", None)
-                            for op in earlier:
-                                op["reconciled_absent_at"] = record["verified_at"]
-                                self.e.save_update("operation", op["operation_id"], op)
-                            break
-                        await asyncio.sleep(1)
-                    if not record.get("deleted"):
-                        raise RuntimeError("Deletion was not independently confirmed")
-            except Exception as exc:
-                record["cleanup_error"] = type(exc).__name__ + ": " + str(exc)
-            self.e.log(
-                "cleanup_vm",
-                id=sid,
-                duration_s=time.monotonic() - started,
-                deleted=record.get("deleted"),
-                error=record.get("cleanup_error"),
-            )
-
         owned = sorted(set(ids))
         for start in range(0, len(owned), self.p.cleanup_concurrency):
-            await asyncio.gather(
-                *(remove(sid) for sid in owned[start:start + self.p.cleanup_concurrency])
-            )
-        self.e.save()
+            chunk = owned[start : start + self.p.cleanup_concurrency]
+            deadline = time.monotonic() + (self.p.cleanup_timeout or 90)
+            started = time.monotonic()
+            pending = set(chunk)
+
+            def mark_absent(absent):
+                for sid in absent:
+                    pending.discard(sid)
+                    record = self.e.state["owned"][sid]
+                    record.update(deleted=True, verified_at=now())
+                    record.pop("cleanup_error", None)
+                    for op in self.e.state["operations"]:
+                        if (
+                            op["kind"] == "delete"
+                            and op.get("id") == sid
+                            and op["status"] == "unconfirmed"
+                        ):
+                            op["reconciled_absent_at"] = record["verified_at"]
+                            self.e.save_update("operation", op["operation_id"], op)
+
+            try:
+                async with asyncio.timeout_at(deadline):
+                    await asyncio.gather(*(self.p.release(sid) for sid in chunk))
+                    mark_absent(
+                        await self.control(
+                            lambda _: self.p.absent_many(chunk), deadline
+                        )
+                    )
+
+                    async def remove(sid):
+                        earlier = [
+                            o
+                            for o in self.e.state["operations"]
+                            if o["kind"] == "delete"
+                            and o.get("id") == sid
+                            and o["status"] == "unconfirmed"
+                            and not o.get("reconciled_absent_at")
+                        ]
+                        if earlier and sid not in confirm_delete:
+                            self.e.state["owned"][sid]["cleanup_error"] = (
+                                "Earlier deletion outcome is unconfirmed; not replaying it"
+                            )
+                            return
+                        missing = [
+                            r
+                            for r in self.e.state["trials"]
+                            if r.get("sandbox_id") == sid
+                            and r["status"] == "passed"
+                            and self.c["suite"] == "workflow"
+                            and not r.get("artifact")
+                        ]
+                        for row in missing:
+                            row["archive_missing_at_delete"] = True
+                            self.e.save_trial(row)
+                        try:
+                            await self.control(
+                                lambda _: self.e.mutation(
+                                    "delete",
+                                    lambda: self.p.delete(sid),
+                                    id=sid,
+                                    operator_confirmed=sid in confirm_delete,
+                                    prior_operation_ids=[
+                                        o["operation_id"] for o in earlier
+                                    ],
+                                ),
+                                deadline,
+                                retry=False,
+                            )
+                        except Exception as exc:
+                            self.e.state["owned"][sid]["cleanup_error"] = (
+                                type(exc).__name__ + ": " + str(exc)
+                            )
+
+                    await asyncio.gather(*(remove(sid) for sid in list(pending)))
+                    delay = 1
+                    while pending and time.monotonic() < deadline:
+                        mark_absent(
+                            await self.control(
+                                lambda _: self.p.absent_many(sorted(pending)), deadline
+                            )
+                        )
+                        if pending:
+                            await asyncio.sleep(
+                                min(delay, max(0, deadline - time.monotonic()))
+                            )
+                            delay = min(8, delay * 2)
+                    if pending:
+                        raise RuntimeError(
+                            "Deletion was not independently confirmed before the deadline"
+                        )
+            except Exception as exc:
+                for sid in pending:
+                    self.e.state["owned"][sid]["cleanup_error"] = (
+                        type(exc).__name__
+                        + ": "
+                        + (
+                            str(exc)
+                            or "Deletion was not independently confirmed before the deadline"
+                        )
+                    )
+            finally:
+                for sid in chunk:
+                    record = self.e.state["owned"][sid]
+                    self.e.log(
+                        "cleanup_vm",
+                        id=sid,
+                        duration_s=time.monotonic() - started,
+                        deleted=record.get("deleted"),
+                        error=record.get("cleanup_error"),
+                    )
+                self.e.save()
 
     async def cleanup(self, confirm_delete=()):
         # Reconcile names after an ambiguous create before deleting known IDs.
         try:
-            inventory = await self.p.inventory()
+            inventory = await self.control(
+                lambda _: self.p.inventory(), time.monotonic() + 90
+            )
             intents = {
                 o.get("name")
                 for o in self.e.state["operations"]
@@ -1031,39 +1268,101 @@ class Runner:
                     self.e.state["owned"].setdefault(
                         vm["id"], {"name": vm["name"], "deleted": False}
                     )
+            self.e.state.pop("reconciliation_error", None)
         except Exception as exc:
-            self.e.state["reconciliation_error"] = str(exc)
+            self.e.state["reconciliation_error"] = type(exc).__name__ + ": " + str(exc)
         await self.cleanup_ids(list(self.e.state["owned"]), confirm_delete)
         for ref in self.e.state["snapshots"]:
+            if ref.get("cleanup_policy") == "provider_expiry" or (
+                self.c["provider"] == "modal" and ref["kind"] == "memory"
+            ):
+                ref.update(status="provider_expiry_pending", deleted=False)
+                self.e.save()
+                continue
             try:
-                if not await self.p.snapshot_absent(ref) and not ref.get(
-                    "delete_submitted"
+                deadline = time.monotonic() + 60
+                if not await self.control(
+                    lambda _: self.p.snapshot_absent(ref), deadline
                 ):
-                    if any(
-                        o["kind"] == "delete_snapshot"
-                        and o.get("snapshot", {}).get("id") == ref["id"]
-                        and o["status"] == "unconfirmed"
-                        for o in self.e.state["operations"]
-                    ):
-                        raise RuntimeError(
-                            "Earlier snapshot deletion is unconfirmed; not replaying it"
+                    if not ref.get("delete_submitted"):
+                        if any(
+                            o["kind"] == "delete_snapshot"
+                            and o.get("snapshot", {}).get("id") == ref["id"]
+                            and o["status"] == "unconfirmed"
+                            for o in self.e.state["operations"]
+                        ):
+                            raise RuntimeError(
+                                "Earlier snapshot deletion is unconfirmed; not replaying it"
+                            )
+                        await self.control(
+                            lambda _: self.e.mutation(
+                                "delete_snapshot",
+                                lambda: self.p.delete_snapshot(ref),
+                                snapshot=ref,
+                            ),
+                            deadline,
+                            retry=False,
                         )
-                    await self.e.mutation(
-                        "delete_snapshot",
-                        lambda: self.p.delete_snapshot(ref),
-                        snapshot=ref,
-                    )
-                    ref["delete_submitted"] = True
-                ref["deleted"] = await self.p.snapshot_absent(ref)
+                        ref["delete_submitted"] = True
+                    deadline = min(deadline, time.monotonic() + 30)
+                    delay = 1
+                    while True:
+                        ref["deleted"] = await self.control(
+                            lambda _: self.p.snapshot_absent(ref), deadline, retry=False
+                        )
+                        if ref["deleted"]:
+                            break
+                        await asyncio.sleep(
+                            min(delay, max(0, deadline - time.monotonic()))
+                        )
+                        delay = min(16, delay * 2)
+                else:
+                    ref["deleted"] = True
+                if ref.get("deleted"):
+                    ref.pop("cleanup_error", None)
+                    for op in self.e.state["operations"]:
+                        if op["kind"] == "delete_snapshot" and op.get("snapshot", {}).get("id") == ref["id"] and op["status"] == "unconfirmed":
+                            op["reconciled_absent_at"] = now()
+                            self.e.save_update("operation", op["operation_id"], op)
             except Exception as exc:
-                ref["cleanup_error"] = str(exc)
+                ref["cleanup_error"] = type(exc).__name__ + ": " + str(exc)
             self.e.save()
         if self.s3:
-            try:
-                self.e.state["s3_cleanup"] = await self.s3.cleanup(self.run_id)
-            except Exception as exc:
-                self.e.state["s3_cleanup"] = {"error": str(exc)}
+            if (
+                self.e.state.get("reconciliation_error")
+                or any(not r.get("deleted") for r in self.e.state["owned"].values())
+                or any(
+                    o["kind"] == "create" and o["status"] == "unconfirmed"
+                    for o in self.e.state["operations"]
+                )
+            ):
+                self.e.state["s3_cleanup"] = {
+                    "deferred": "Run-owned writers are not confirmed absent"
+                }
+            else:
+                try:
+                    self.e.state["s3_cleanup"] = await self.s3.cleanup(self.run_id)
+                except Exception as exc:
+                    self.e.state["s3_cleanup"] = {"error": str(exc)}
         self.e.save()
+
+    async def finish(self):
+        try:
+            deadline = time.monotonic() + 120
+            async with asyncio.timeout_at(deadline):
+                await asyncio.gather(
+                    *(
+                        self.artifact(r, deadline)
+                        for r in self.e.state["trials"]
+                        if r["status"] == "passed"
+                        and r.get("sandbox_id")
+                        and not self.e.state["owned"][r["sandbox_id"]].get("deleted")
+                    )
+                )
+        except TimeoutError:
+            self.e.log("collection_budget_exhausted", budget_s=120)
+        finally:
+            await self.cleanup()
 
     def require_confirmed_operations(self):
         if any(
@@ -1161,14 +1460,27 @@ class Runner:
             )
             await self.activity(rows)
             await asyncio.gather(*(self.artifact(r) for r in rows))
-            if case == "fresh" and "resume" in self.c["lifecycles"]:
-                resumed = await asyncio.gather(*(self.resume_trial(row) for row in rows))
+            capacity_failed = any(
+                r.get("failure_domain") == "provider_capacity" for r in rows
+            )
+            if (
+                case == "fresh"
+                and "resume" in self.c["lifecycles"]
+                and not capacity_failed
+            ):
+                resumed = await asyncio.gather(
+                    *(self.resume_trial(row) for row in rows)
+                )
                 resumed = [row for row in resumed if row is not None]
                 await self.activity(resumed)
                 await asyncio.gather(*(self.artifact(r) for r in resumed))
             await self.cleanup_ids(
                 [r["sandbox_id"] for r in rows if r.get("sandbox_id")]
             )
+            if capacity_failed:
+                raise RuntimeError(
+                    "Provider capacity rejected this batch; later lifecycle cases remain unrun"
+                )
             if any(
                 not v.get("deleted")
                 for k, v in self.e.state["owned"].items()
@@ -1192,6 +1504,8 @@ class Runner:
             "s3_write_ready_s": "Guest S3 write completion, translated to the latest edge of the terminal-probe clock-alignment interval; excludes subsequent state capture and independent verification.",
             "s3_verified_s": "Controller observation after independent S3 readback succeeds; currently the final full-workflow milestone.",
             "controller_observations": "Direct event-loop lateness samples at 100 ms, local evidence-write intervals, command/lifecycle send/receive times and S3 executor queue/return delays. No observed delay is subtracted from workload timings.",
+            "activity": "One shared future controller-monotonic target mapped through fresh guest clock intervals. Conservative event bounds must meet the unchanged 5-second schedule, 1-second lateness tolerance and 61-second completion limit. Unconfirmed alignment is never a pass. Wall clocks are diagnostic only.",
+            "control_requests_per_second": self.p.control_requests_per_second,
             "native_waits": {
                 "beam": "Native wait=True first; when it returns a running PID, observe that same PID at 100 ms without replay; each observation is logged",
                 "tensorlake": "Blocking create; resume SDK polling at 100 ms",
@@ -1217,7 +1531,15 @@ class Runner:
             raise
         finally:
             try:
-                await self.cleanup()
+                finish = asyncio.create_task(self.finish())
+                # Finalization has bounded collection and per-chunk cleanup budgets.
+                # Repeated SIGINT must not cancel deletion halfway through.
+                while not finish.done():
+                    try:
+                        await asyncio.shield(finish)
+                    except asyncio.CancelledError:
+                        continue
+                await finish
             finally:
                 monitor.cancel()
                 try:
@@ -1259,6 +1581,7 @@ def summarize(state):
         "provider": state["config"]["provider"],
         "status": state["status"],
         "timing_protocol": state.get("timing_protocol"),
+        "activity_protocol": state.get("activity_protocol"),
         "prepared_tools": state.get("prepared_tools"),
         "timing_contract": state.get("timing_contract"),
         "controller_observations": state.get("controller_observations"),
@@ -1278,7 +1601,9 @@ def summarize(state):
             "attempted": sum("t0" in r for r in rows),
             "passed": sum(r["status"] == "passed" for r in rows),
             "ineligible": sum(r["status"] == "ineligible" for r in rows),
-            "unrun": state["config"]["count"] - len(rows),
+            "unrun": state["config"]["count"]
+            - len(rows)
+            + sum(r["status"] == "queued" for r in rows),
             "clean_activity": sum(
                 r.get("activity", {}).get("passed", False) for r in rows
             ),
@@ -1301,6 +1626,37 @@ def summarize(state):
                 if r["status"] != "passed"
             ],
         }
+        activity_rows = [r["activity"] for r in rows if r.get("activity") is not None]
+        categories = [activity_category(a) for a in activity_rows]
+        result["cases"][case].update(
+            {
+                "activity_functional": sum(
+                    len(a.get("events", [])) == 12
+                    and all(
+                        e.get("passed") and e.get("external_s3", {}).get("passed")
+                        for e in a["events"]
+                    )
+                    for a in activity_rows
+                ),
+                **{
+                    "activity_" + category: categories.count(category)
+                    for category in (
+                        "cadence_miss",
+                        "unarmed",
+                        "unobserved",
+                        "functional_failure",
+                        "unknown",
+                    )
+                },
+                "activity_tick_zero_s": timing_stats(
+                    [
+                        a["events"][0]["duration_s"]
+                        for a in activity_rows
+                        if a.get("events")
+                    ]
+                ),
+            }
+        )
         result["cases"][case]["timings_s"] = {}
         for field in (
             "terminal_ready_s",
