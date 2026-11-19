@@ -1602,6 +1602,8 @@ def summarize(state):
             "requested": state["config"]["count"],
             "attempted": sum("t0" in r for r in rows),
             "passed": sum(r["status"] == "passed" for r in rows),
+            "archives": sum(bool(r.get("artifact")) for r in rows if r["status"] == "passed"),
+            "missing_archives": [r["index"] for r in rows if r["status"] == "passed" and state["config"]["suite"] == "workflow" and not r.get("artifact")],
             "ineligible": sum(r["status"] == "ineligible" for r in rows),
             "unrun": state["config"]["count"]
             - len(rows)
@@ -1726,7 +1728,7 @@ def complete(report, config):
         and cleanup_complete(report)
         and all(
             v["passed"] == v["requested"]
-            and (config["suite"] != "workflow" or v["clean_activity"] == v["passed"])
+            and (config["suite"] != "workflow" or v["clean_activity"] == v["passed"] and not v["missing_archives"])
             for v in report["cases"].values()
         )
     )

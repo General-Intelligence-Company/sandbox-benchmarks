@@ -35,11 +35,11 @@
     "sandbox_bench/__init__.py": "7861300e148959da570cd348089880f4ddd32859b4f6b77db9441669de0ef5c3",
     "sandbox_bench/cli.py": "17463a2498c4332496e772f74a56926401b0b47589da4c7ab23d25646c807dad",
     "sandbox_bench/providers.py": "e2ed8cc327cf1072a772f0d42a92454d93534d0e6ff8eb0a4a228e66f4225eb2",
-    "sandbox_bench/runner.py": "2c1edd4b73630fde94e625d914f894b2b73404e2914ffbd77422de8c078e946e",
+    "sandbox_bench/runner.py": "6f36e60a35fa16d47a67201bdb229362c5cbdd46c641fe7faee1b8280fa19794",
     "sandbox_bench/tools.py": "bb602c86344ebef8283fd172848746695da427fc02ba99ef9e2c139b4f32864b",
     "tests/test_portable_runner.py": "77f07d953b04cc112f84eb1a9d42f7031b86e7b81ccb103f658ee82c10561efa",
     "uv.lock": "f5054cad3cda393dd94d22df69a9e16ea1626aab52a5c3dadda64c1171f93bf5",
     "sandbox_bench/activity.py": "599fadd58e64b47260150b4b9bdaca47752909d380bd316cf7ec71c62839ef32",
-    "tests/test_activity.py": "05f879febedf09703cdb4d8f3ecebbdce74ef1495fe7775ce3c3e94978967677"
+    "tests/test_activity.py": "e8c952613778c22fd989b23f5ded1ce4ae689c9b8ba2a861450fd316ccc747a2"
   }
 }

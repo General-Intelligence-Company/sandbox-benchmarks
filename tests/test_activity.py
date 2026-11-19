@@ -86,7 +86,7 @@ def test_queued_rows_are_unrun_but_ineligible_resumes_are_not():
     state = {
         "run_id": "counts",
         "status": "interrupted",
-        "config": {"provider": "beam", "lifecycles": ["fresh", "resume"], "count": 2},
+        "config": {"provider": "beam", "suite": "commands", "lifecycles": ["fresh", "resume"], "count": 2},
         "trials": [
             {"case": "fresh", "index": 1, "status": "failed", "t0": 1},
             {"case": "fresh", "index": 2, "status": "queued"},
