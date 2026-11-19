@@ -8,6 +8,7 @@ import shlex
 import subprocess
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import PurePosixPath
 from typing import Any
 from urllib.parse import quote
@@ -64,9 +65,14 @@ SPECS = {
 
 
 class ProviderError(RuntimeError):
-    def __init__(self, message, status=None):
+    def __init__(
+        self, message, status=None, *, terminal=False, domain=None, retry_after=None
+    ):
         super().__init__(message)
         self.status_code = status
+        self.terminal = terminal
+        self.domain = domain
+        self.retry_after = retry_after
 
 
 @dataclass
@@ -85,6 +91,8 @@ class Provider:
     release_snapshot_source = False
     cleanup_concurrency = 1
     cleanup_timeout = None
+    control_concurrency = 32
+    control_requests_per_second = 32
 
     def __init__(self, config):
         self.config = config
@@ -134,6 +142,11 @@ class Provider:
 
     async def snapshot_absent(self, ref):
         raise NotImplementedError
+
+    async def absent_many(self, ids):
+        # The runner passes only one cleanup-concurrency-sized chunk.
+        absent = await asyncio.gather(*(self.absent(sid) for sid in ids))
+        return {sid for sid, gone in zip(ids, absent) if gone}
 
 
 class Tensorlake(Provider):
@@ -373,6 +386,14 @@ class Modal(Provider):
         sb = await self.handle(sid)
         if kind == "memory":
             snap = await sb._experimental_snapshot.aio()
+            return {
+                "id": snap.object_id,
+                "kind": kind,
+                "cleanup_policy": "provider_expiry",
+                "expiry_expected_by": (
+                    datetime.now(timezone.utc) + timedelta(days=7)
+                ).isoformat(),
+            }
         else:
             snap = await sb.snapshot_filesystem.aio(
                 timeout=180, ttl=self.config["ttl_seconds"]
@@ -575,6 +596,8 @@ class Blaxel(Provider):
 
 class Boat(Provider):
     resume_memory = False
+    control_concurrency = 16
+    control_requests_per_second = 16
 
     def __init__(self, config):
         super().__init__(config)
@@ -711,6 +734,10 @@ class Boat(Provider):
 
 
 class Exe(Provider):
+    control_concurrency = 8
+    control_requests_per_second = 2.5
+    cleanup_concurrency = 5
+
     def __init__(self, config):
         super().__init__(config)
         self.http = httpx.AsyncClient(
@@ -727,7 +754,9 @@ class Exe(Provider):
             headers={"Accept": "application/x-ndjson"} if ndjson else None,
         )
         if r.is_error:
-            raise ProviderError(r.text[:2000], r.status_code)
+            raise ProviderError(
+                r.text[:2000], r.status_code, retry_after=r.headers.get("Retry-After")
+            )
         try:
             result = r.json()
         except json.JSONDecodeError:
@@ -778,6 +807,10 @@ class Exe(Provider):
 
     async def absent(self, sid):
         return not any(x["id"] == sid for x in await self.inventory())
+
+    async def absent_many(self, ids):
+        present = {vm["id"] for vm in await self.inventory()}
+        return set(ids) - present
 
     async def delete(self, sid):
         await self.api("rm " + shlex.quote(sid))
@@ -907,6 +940,21 @@ class Beam(Provider):
 
             vm = self.vm(sid)
             vm._set(self.request(vm, "GET", vm._path()))
+            if vm.info.get("status") == "error":
+                error = vm.info.get("error") or "Beam VM is in an error state"
+                capacity = (
+                    "concurrency_limit_reached" in error
+                    or "quota exceeded" in error.lower()
+                )
+                raise ProviderError(
+                    error,
+                    terminal=True,
+                    domain="provider_capacity" if capacity else "provider",
+                )
+            if not vm.info.get("container_id"):
+                raise ProviderError(
+                    "Beam VM not scheduled; status=" + str(vm.info.get("status"))
+                )
             cid = vm.info["container_id"]
             stub = PodServiceStub(vm._service.channel)
 

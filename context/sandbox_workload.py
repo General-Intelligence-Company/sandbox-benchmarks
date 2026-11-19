@@ -629,12 +629,12 @@ class SandboxWorkload:
         if (
             self.activity
             and (not self.activity["done"])
-            and (time.time() >= self.activity["epoch"])
+            and (time.monotonic() >= self.activity["start_monotonic"])
         ):
             i = len(self.activity["events"])
             if (
                 i < self.activity["cycles"]
-                and time.time() >= self.activity["epoch"] + 5 * i
+                and time.monotonic() >= self.activity["start_monotonic"] + 5 * i
             ):
                 self.set_current_step("activity")
                 t = time.monotonic()
@@ -666,18 +666,19 @@ class SandboxWorkload:
                     at=utc_now(),
                     duration_s=time.monotonic() - t,
                     guest_monotonic=time.monotonic(),
+                    started_monotonic=t,
                     scheduled_epoch=self.activity["epoch"] + 5 * i,
+                    scheduled_monotonic=self.activity["start_monotonic"] + 5 * i,
                     start_lateness_s=max(
                         0,
-                        time.time()
-                        - (time.monotonic() - t)
-                        - (self.activity["epoch"] + 5 * i),
+                        t - (self.activity["start_monotonic"] + 5 * i),
                     ),
                 )
                 self.activity["events"].append(event)
                 self.record_event("activity", record=event)
             if (
-                time.time() >= self.activity["epoch"] + self.activity["duration"]
+                time.monotonic()
+                >= self.activity["start_monotonic"] + self.activity["duration"]
                 and len(self.activity["events"]) == self.activity["cycles"]
             ):
                 self.activity["done"] = True
