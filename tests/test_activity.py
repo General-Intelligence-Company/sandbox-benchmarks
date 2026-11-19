@@ -46,6 +46,28 @@ def test_real_slow_work_stays_a_cadence_failure():
     assert activity_category(result) == "cadence_miss"
 
 
+def test_clock_interval_straddling_deadline_is_not_a_provider_failure():
+    clock = ClockAlignment(50, 51.8)
+    start = clock.guest_at(1000)
+    events = [
+        {
+            "index": i,
+            "passed": True,
+            "external_s3": {"passed": True},
+            "started_monotonic": start + 5 * i + 0.2,
+            "guest_monotonic": start + 5 * i + 0.4,
+        }
+        for i in range(12)
+    ]
+    result = score_activity(
+        {"done": True, "events": events},
+        {"start_monotonic": 1000, "epoch": 2000, "alignment_confirmed": True},
+        clock,
+    )
+    assert result["functional"] and not result["passed"]
+    assert activity_category(result) == "unobserved"
+
+
 def test_clock_reset_is_detected_and_overlapping_samples_narrow_bounds():
     clock = ClockAlignment(50, 51)
     assert clock.intersect(ClockAlignment(50.2, 50.5)) == ClockAlignment(50.2, 50.5)

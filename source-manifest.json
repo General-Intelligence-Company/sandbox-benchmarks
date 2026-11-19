@@ -4,7 +4,7 @@
   "fixture_commit": "a9f23fbc4ccddfd43d8a72e6b4ab5d369fd102a5",
   "files": {
     ".gitignore": "acf343401a6d551be9a42c298c265a578368a8a75a2fb4722d7493fd9b7c8a26",
-    "README.md": "27cb8f5bb8775dc46a160f83afb3a7e9f3e15ab2183c4cd266eee78835aad89a",
+    "README.md": "1d1d3a86232dbf95e758058790f9b979b3dac6992e6abed2ff4b90428f195c4f",
     "check_source_integrity.py": "46503125abc4c2fe92250f3126ec081a66545817098345b76ed5fa6684c216e7",
     "context/bench-resource-recorder.service": "589711be9ea8668603ba214daa162af7f66aa44d2206e743596d55451c55319c",
     "context/manifest.example.json": "1961bf042f785752aecf47d327c8f130a1222a1d0dc2c74438dd582f66d3cc29",
@@ -39,7 +39,7 @@
     "sandbox_bench/tools.py": "bb602c86344ebef8283fd172848746695da427fc02ba99ef9e2c139b4f32864b",
     "tests/test_portable_runner.py": "77f07d953b04cc112f84eb1a9d42f7031b86e7b81ccb103f658ee82c10561efa",
     "uv.lock": "f5054cad3cda393dd94d22df69a9e16ea1626aab52a5c3dadda64c1171f93bf5",
-    "sandbox_bench/activity.py": "142dea3390a9c0dcbe53e0f8b3af412b04d4af023d6fff544a90282b812900dc",
-    "tests/test_activity.py": "b65dc82bbd1c37cbe1878dd1201fb823658f031a08d762f942d281957a3a4272"
+    "sandbox_bench/activity.py": "599fadd58e64b47260150b4b9bdaca47752909d380bd316cf7ec71c62839ef32",
+    "tests/test_activity.py": "05f879febedf09703cdb4d8f3ecebbdce74ef1495fe7775ce3c3e94978967677"
   }
 }

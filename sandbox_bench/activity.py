@@ -41,12 +41,23 @@ def score_activity(value, schedule, alignment):
         event.update(
             controller_start_bounds=[start_lower, start_upper],
             controller_end_bounds=[end_lower, end_upper],
+            start_lateness_lower_s=max(0, start_lower - due),
             start_lateness_upper_s=max(0, start_upper - due),
         )
     functional = len(events) == 12 and all(
         e.get("passed") and e.get("external_s3", {}).get("passed") for e in events
     )
     aligned = schedule["alignment_confirmed"]
+    definite_miss = any(
+        e["start_lateness_lower_s"] > 1
+        or e["controller_end_bounds"][0] > schedule["start_monotonic"] + 61
+        for e in events
+    )
+    uncertain = not definite_miss and any(
+        e["start_lateness_upper_s"] > 1
+        or e["controller_end_bounds"][1] > schedule["start_monotonic"] + 61
+        for e in events
+    )
     passed = bool(value["done"] and functional and aligned) and all(
         e["start_lateness_upper_s"] <= 1
         and e["controller_end_bounds"][1] <= schedule["start_monotonic"] + 61
@@ -58,11 +69,12 @@ def score_activity(value, schedule, alignment):
         "armed": True,
         "observed": bool(value["done"]),
         "alignment_confirmed": aligned,
+        "timing_confirmed": not uncertain,
         "window_start": schedule["epoch"],
         "window_end": schedule["epoch"] + 60,
         "events": events,
         "done": value["done"],
-        **({"failure_domain": "harness_control"} if not aligned else {}),
+        **({"failure_domain": "harness_control"} if not aligned or uncertain else {}),
     }
 
 
@@ -74,6 +86,7 @@ def activity_category(activity):
     if (
         activity.get("observed") is False
         or activity.get("alignment_confirmed") is False
+        or activity.get("timing_confirmed") is False
     ):
         return "unobserved"
     events = activity.get("events", [])
