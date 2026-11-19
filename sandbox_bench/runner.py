@@ -378,7 +378,6 @@ class Runner:
         self.c, self.p, self.e, self.s3 = config, provider, evidence, fixture
         self.slots = asyncio.Semaphore(config["concurrency"])
         self.run_id = self.e.state["run_id"]
-        self.guest_round_trip_s = 0.0
         self.loop_observations = []
         self.control_slots = asyncio.Semaphore(provider.control_concurrency)
         self.next_control_request = 0.0
@@ -721,9 +720,6 @@ class Runner:
         # tolerates that framing without changing JSON strings or their bytes.
         started = time.monotonic()
         output = await self.exec(sid, python(code), timeout + 10)
-        self.guest_round_trip_s = max(
-            self.guest_round_trip_s, time.monotonic() - started
-        )
         data = json.loads(base64.b64decode(output))
         if not data["ok"]:
             raise GuestFailure(data)
