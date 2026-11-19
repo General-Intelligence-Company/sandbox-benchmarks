@@ -409,7 +409,9 @@ class Runner:
                         remaining = deadline - time.monotonic()
                         attempts += 1
                         async with asyncio.timeout(min(call_timeout, remaining)):
-                            return await fn(min(call_timeout, remaining))
+                            # Native SDK timeout schemas use integer seconds. The
+                            # enclosing timer still enforces the precise deadline.
+                            return await fn(max(1, math.ceil(min(call_timeout, remaining))))
             except Exception as exc:
                 if (
                     not retry
@@ -1125,7 +1127,7 @@ class Runner:
             )
             path = self.e.path / "artifacts" / f"{row['case']}-{row['index']}.zip"
             path.parent.mkdir(exist_ok=True)
-            path.write_bytes(base64.b64decode(data, validate=True))
+            path.write_bytes(base64.b64decode("".join(data.split()), validate=True))
             row["artifact"] = str(path.relative_to(self.e.path))
             row.pop("collection_error", None)
             row.pop("archive_missing_at_delete", None)
