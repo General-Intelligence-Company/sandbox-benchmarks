@@ -447,6 +447,23 @@ class Blaxel(Provider):
         from blaxel.core.client.client import client
 
         self.Sandbox, self.Snapshot, self.client = SandboxInstance, Snapshot, client
+        self.awake_processes = {}
+
+    async def keep_awake(self, sid, sb):
+        name = "bench-awake-" + str(time.time_ns())
+        try:
+            process = await sb.process.exec({
+                "name": name,
+                "command": "sleep " + str(self.config["ttl_seconds"]),
+                "wait_for_completion": False,
+                "timeout": self.config["ttl_seconds"],
+                "keep_alive": True,
+            })
+            if str(process.status) != "running" or process.keep_alive is not True:
+                raise ProviderError("Could not hold sandbox awake")
+            self.awake_processes[sid] = name
+        finally:
+            await sb.process.get_client().aclose()
 
     async def create(self, name, ref=None):
         if ref:
@@ -503,6 +520,8 @@ class Blaxel(Provider):
         return None
 
     async def start_service(self, sid, command, log_path):
+        if "resume" in self.config["lifecycles"] and sid not in self.awake_processes:
+            await self.keep_awake(sid, await self.Sandbox.get(sid))
         sb = await self.Sandbox.get(sid)
         process = await sb.process.exec(
             {
@@ -542,6 +561,13 @@ class Blaxel(Provider):
         return Command(p.stdout or "", p.stderr or "", p.exit_code)
 
     async def pause(self, sid):
+        sb = await self.Sandbox.get(sid)
+        try:
+            # Stop only the harness hold, keeping the app and browser intact.
+            await sb.process.stop(self.awake_processes[sid])
+            del self.awake_processes[sid]
+        finally:
+            await sb.process.get_client().aclose()
         # Control-plane reads do not wake the guest. The idle wait and metadata
         # lookup finish before the runner starts the native resume clock.
         started = time.monotonic()
@@ -568,22 +594,10 @@ class Blaxel(Provider):
         raise ProviderError("Automatic standby was not observed within 180 seconds")
 
     async def resume(self, sid):
-        sb = self.handles.pop(sid)
-        try:
-            # Blaxel has no separate resume RPC: this single blocking command
-            # is the waking request, including transport and command execution.
-            process = await sb.process.exec({
-                "name": "bench-wake-" + str(time.time_ns()),
-                "command": "true",
-                "wait_for_completion": True,
-                "timeout": 180,
-                "keep_alive": False,
-            })
-            if process.exit_code != 0:
-                raise ProviderError("Standby wake command failed: " + (process.stderr or ""))
-            return sid
-        finally:
-            await sb.process.get_client().aclose()
+        # This one native process request wakes the guest and holds it active.
+        # Subsequent terminal and workflow checks have their own measurements.
+        await self.keep_awake(sid, self.handles.pop(sid))
+        return sid
 
     async def inventory(self):
         page = await self.Sandbox.list()
