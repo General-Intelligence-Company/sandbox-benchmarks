@@ -438,6 +438,7 @@ class Modal(Provider):
 
 class Blaxel(Provider):
     native_tools_build = True
+    cleanup_concurrency = 16
 
     def __init__(self, config):
         super().__init__(config)
