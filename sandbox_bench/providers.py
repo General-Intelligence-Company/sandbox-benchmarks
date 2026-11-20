@@ -504,7 +504,21 @@ class Blaxel(Provider):
                     "mkdir -p /opt/bench && tar xzf /tmp/bench-tools.tar.gz -C /opt/bench && rm /tmp/bench-tools.tar.gz"
                 )
             )
-            await image.build(name=name, memory=self.config["memory_mb"], timeout=1800)
+            try:
+                await image.build(name=name, memory=self.config["memory_mb"], timeout=1800)
+            except Exception as exc:
+                response = await self.client.get_async_httpx_client().get(
+                    "/sandboxes/" + quote(name, safe=""),
+                    headers={"Cache-Control": "no-cache"},
+                )
+                if response.status_code == 200:
+                    state = response.json()
+                    raise ProviderError(
+                        str(exc) + ": " + json.dumps({
+                            "status": state.get("status"), "errors": state.get("errors")
+                        })
+                    ) from exc
+                raise
         return name
 
     async def tools_snapshot(self, sid, name):
