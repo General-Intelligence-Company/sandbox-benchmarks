@@ -493,7 +493,8 @@ class Blaxel(Provider):
             path = Path(directory) / "tools.tar.gz"
             path.write_bytes(archive)
             image = (
-                ImageInstance.from_registry("python:3.11-slim-bookworm")
+                # Same Docker Official Image, without Docker Hub's shared pull quota.
+                ImageInstance.from_registry("public.ecr.aws/docker/library/python:3.11-slim-bookworm")
                 .run_commands(
                     "printf %s "
                     + shlex.quote(base64.b64encode(install.encode()).decode())
@@ -515,7 +516,11 @@ class Blaxel(Provider):
                     state = response.json()
                     raise ProviderError(
                         str(exc) + ": " + json.dumps({
-                            "status": state.get("status"), "errors": state.get("errors")
+                            "status": state.get("status"), "errors": state.get("errors"),
+                            "failed_events": [
+                                {"type": e.get("type"), "message": e.get("message", "")[-2000:]}
+                                for e in (state.get("events") or []) if e.get("status") == "FAILED"
+                            ],
                         })
                     ) from exc
                 raise
