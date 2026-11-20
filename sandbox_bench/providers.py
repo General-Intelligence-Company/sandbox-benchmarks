@@ -46,8 +46,8 @@ SPECS = {
     "blaxel": ProviderSpec(
         ("BL_API_KEY", "BL_WORKSPACE"),
         "blaxel",
-        ("fresh", "memory"),
-        "Snapshots capture RAM and filesystem and require preview access. No disk-only fork or explicit pause test in this adapter.",
+        ("fresh", "memory", "resume"),
+        "Snapshots capture RAM and filesystem and require preview access. Resume wakes the same sandbox after observed automatic standby; no disk-only fork.",
     ),
     "beam": ProviderSpec(
         ("BEAM_API_KEY",),
@@ -513,26 +513,77 @@ class Blaxel(Provider):
                     + " && exec " + command + " >> " + shlex.quote(log_path) + " 2>&1"
                 ),
                 "wait_for_completion": False,
-                "keep_alive": True,
+                # Resume tests must allow the running services to enter standby.
+                "keep_alive": "resume" not in self.config["lifecycles"],
                 "timeout": self.config["ttl_seconds"],
             }
         )
+        if "resume" in self.config["lifecycles"]:
+            await sb.process.get_client().aclose()
         return int(process.pid)
 
     async def exec(self, sid, command, timeout=180):
         sb = await self.Sandbox.get(sid)
         # Explicitly forward workspace authentication using the supported SDK.
         # Do not replace its client with a custom unauthenticated HTTP session.
-        p = await sb.process.exec(
-            {
-                "name": "bench-" + str(time.time_ns()),
-                "command": command,
-                "wait_for_completion": True,
-                "timeout": timeout,
-                "keep_alive": False,
-            }
-        )
+        try:
+            p = await sb.process.exec(
+                {
+                    "name": "bench-" + str(time.time_ns()),
+                    "command": command,
+                    "wait_for_completion": True,
+                    "timeout": timeout,
+                    "keep_alive": False,
+                }
+            )
+        finally:
+            if "resume" in self.config["lifecycles"]:
+                await sb.process.get_client().aclose()
         return Command(p.stdout or "", p.stderr or "", p.exit_code)
+
+    async def pause(self, sid):
+        # Control-plane reads do not wake the guest. The idle wait and metadata
+        # lookup finish before the runner starts the native resume clock.
+        started = time.monotonic()
+        observations = []
+        while time.monotonic() - started < 180:
+            response = await self.client.get_async_httpx_client().get(
+                "/sandboxes/" + quote(sid, safe=""),
+                headers={"Cache-Control": "no-cache"},
+                params={"benchmark_probe": str(time.time_ns())},
+            )
+            response.raise_for_status()
+            state = response.json()
+            observations.append({
+                "elapsed_s": time.monotonic() - started,
+                "status": state.get("status"),
+                "state": state.get("state"),
+            })
+            if state.get("state") == "STANDBY":
+                self.handles[sid] = await self.Sandbox.get(sid)
+                return {"automatic_standby": True, "observations": observations}
+            if state.get("status") in ("TERMINATED", "FAILED", "DELETING"):
+                raise ProviderError("Sandbox became unavailable before standby: " + str(state))
+            await asyncio.sleep(1)
+        raise ProviderError("Automatic standby was not observed within 180 seconds")
+
+    async def resume(self, sid):
+        sb = self.handles.pop(sid)
+        try:
+            # Blaxel has no separate resume RPC: this single blocking command
+            # is the waking request, including transport and command execution.
+            process = await sb.process.exec({
+                "name": "bench-wake-" + str(time.time_ns()),
+                "command": "true",
+                "wait_for_completion": True,
+                "timeout": 180,
+                "keep_alive": False,
+            })
+            if process.exit_code != 0:
+                raise ProviderError("Standby wake command failed: " + (process.stderr or ""))
+            return sid
+        finally:
+            await sb.process.get_client().aclose()
 
     async def inventory(self):
         page = await self.Sandbox.list()
