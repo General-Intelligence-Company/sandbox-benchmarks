@@ -9,8 +9,8 @@ This started as our Tensorlake benchmark. The [original controller and setup ins
 Use Python 3.11–3.13. Install the provider you want:
 
 ```sh
-git clone https://github.com/General-Intelligence-Company/tensorlake-sandbox-benchmarks.git
-cd tensorlake-sandbox-benchmarks
+git clone https://github.com/General-Intelligence-Company/sandbox-benchmarks.git
+cd sandbox-benchmarks
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e '.[tensorlake]'
