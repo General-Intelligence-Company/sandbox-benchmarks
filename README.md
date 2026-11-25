@@ -104,7 +104,7 @@ These runs create a lot of billable resources: 100 sandboxes per lifecycle at N=
 | Figure 2: provider call time | Same N=100 run | `provider_lifecycle_s`, with `harness_setup_s`, `guest_workflow_s` and `external_verification_s` in its exact-values table |
 | Reliability table | Same N=100 run | `clean_activity` out of `requested` |
 | Figure 3: 1,000 sandboxes | N=1,000, as several runs | Trial rows pooled across those runs |
-| Figure 4 and the concurrent-command check | Not this harness | See [What this harness does not produce](#what-this-harness-does-not-produce) |
+| Figure 4: 20 commands in a row | Not this harness yet | See [What this harness does not produce](#what-this-harness-does-not-produce) |
 
 Every published workflow run used prepared tools and the same requested shape, with an `[s3]` section as described in [Run the full workload](#run-the-full-workload):
 
@@ -243,11 +243,8 @@ Figure 3's three views are `terminal_ready_s` for `fresh`, `full_workflow_s` for
 ### What this harness does not produce
 
 - Figure 4, 20 sequential commands in each of 100 disk-snapshot sandboxes, ran with a separate script on October 23 for Tensorlake and Modal and November 2 for Boat. That script is not in this repository yet, and `suite = "commands"` is a smoke test, not that benchmark.
-- The five-concurrent-command check is not in this repository either.
-- The Vercel row of the reliability table came from a separate Vercel runner. This repository has no Vercel adapter.
-- The Blaxel resume row, a wake from automatic standby, used the unmerged `codex/blaxel-resume-sup-8181` branch. The Blaxel adapter on `main` supports `fresh` and `memory` only.
-- The provider comparison table comes from provider documentation and from the nine-part coding and seven-part library tests, which ran as separate agent sessions rather than with this harness.
-- The cost charts are arithmetic on October 2026 list prices, not measurements. Snapshot cost is 10,000 snapshots × 10 GB × the monthly per-GB rate, or (10,000 − 10 included) × $1.70 per snapshot for Boat. Compute cost is 100,000 hours × the hourly rate of each provider's closest shape to 4 vCPU and 8 GB. Check current prices before reusing them.
+- The Vercel row of the reliability table used a Vercel adapter that is not in this repository yet.
+- The Blaxel resume row, a wake from automatic standby, used the change in [#10](https://github.com/General-Intelligence-Company/sandbox-benchmarks/pull/10), which is not merged yet. Until it is, the Blaxel adapter supports `fresh` and `memory` only.
 
 ## Read the results
 
