@@ -4,6 +4,8 @@ Pick a provider, supply your own credentials, and run the same scripted checks. 
 
 This started as our Tensorlake benchmark. The [original controller and setup instructions](docs/tensorlake-reference.md) remain available for reproducing that protocol. The portable runner reuses its app, browser, S3 and saved-state workload. It does not rewrite historical results.
 
+To get the numbers behind each chart and table in [Choosing a sandbox provider](https://cofounder.co/research/sandbox-providers), see [Reproduce the published results](#reproduce-the-published-results).
+
 ## Get started
 
 Use Python 3.11–3.13. Install the provider you want:
@@ -89,6 +91,160 @@ seed = "readme.txt"
 **`count` is the total per lifecycle, not the concurrent VM count.** `batch_size` limits resident measured sandboxes; `concurrency` limits simultaneous trial setup. A snapshot source adds one resident VM. The defaults are deliberately small. Keep the total below your account capacity and leave room for other users. This runner does not reserve organization-wide capacity against other clients.
 
 Temporary AWS credentials must have at least 25 minutes left before a batch starts. They are not refreshed inside saved memory. If they expire or a quota blocks admission, the run stops, retains unfinished counts and cleans up what it can. There is no automatic continuation or replay of an interrupted lifecycle operation.
+
+## Reproduce the published results
+
+[Choosing a sandbox provider: lessons from 13,000 launches](https://cofounder.co/research/sandbox-providers) reports results from this harness. This section lists the run behind each figure and table, and where each published number appears in the output.
+
+These runs create a lot of billable resources: 100 sandboxes per lifecycle at N=100 and 1,000 per lifecycle at N=1,000, plus preparation and snapshot sources. Your numbers will differ from ours. Region, where the controller runs, account limits and the day all move them, and provider calls include the network round trip from your controller.
+
+| Published result | Run | Where the numbers are |
+| --- | --- | --- |
+| Figure 1: time until the whole workflow works | N=100 | `terminal_ready_s`, `local_write_ready_s`, `s3_verified_s` and `full_workflow_s` in `summary.json` |
+| Figure 2: provider call time | Same N=100 run | `provider_lifecycle_s`, with `harness_setup_s`, `guest_workflow_s` and `external_verification_s` in its exact-values table |
+| Reliability table | Same N=100 run | `clean_activity` out of `requested` |
+| Figure 3: 1,000 sandboxes | N=1,000, as several runs | Trial rows pooled across those runs |
+| Figure 4: 20 commands in a row | Not this harness yet | See [What this harness does not produce](#what-this-harness-does-not-produce) |
+
+Every published workflow run used prepared tools and the same requested shape, with an `[s3]` section as described in [Run the full workload](#run-the-full-workload):
+
+```toml
+suite = "workflow"
+prepared = true
+cpus = 4
+memory_mb = 8192
+disk_mb = 20480
+```
+
+We ran the SDK versions pinned in `pyproject.toml`. The Tensorlake N=1,000 run used commit `77901cc`; later commits on `main` change only documentation.
+
+### N=100: Figures 1 and 2 and the reliability table
+
+Run one config per provider with `count = 100` and `batch_size = 100`, and these lifecycles and setup concurrency:
+
+| Provider | `lifecycles` | `concurrency` | Account prerequisites |
+| --- | --- | --- | --- |
+| Tensorlake | `["fresh", "disk", "memory", "resume"]` | 64 | Memory snapshot access. We also set `customer_headroom = 500` and `organization_sandbox_limit = 1000`. |
+| Modal | `["fresh", "disk", "memory"]` | 64 | Memory snapshot access. |
+| Blaxel | `["fresh", "memory"]` | 64 | Snapshot preview access. |
+| Beam VMs | `["fresh", "disk", "resume"]` | 64 | A workspace limit above 400 vCPUs. Ours was raised to 1,000 after 100 stopped the first attempt. |
+| exe.dev | `["fresh", "disk", "resume"]` | 8 | A key that allows `new`, `ls`, `ssh`, `cp`, `pause`, `resume` and `rm`. |
+| Boat | `["fresh", "resume"]`, then `["disk"]` as a second run | 3 | Enough start allowance. Ours was 420 active sandboxes and 42 starts per minute. |
+
+For example, the Tensorlake config:
+
+```toml
+provider = "tensorlake"
+suite = "workflow"
+prepared = true
+count = 100
+batch_size = 100
+concurrency = 64
+customer_headroom = 500
+organization_sandbox_limit = 1000
+lifecycles = ["fresh", "disk", "memory", "resume"]
+cpus = 4
+memory_mb = 8192
+disk_mb = 20480
+ttl_seconds = 3600
+
+[s3]
+profile = "my-benchmark-role"
+expected_account = "123456789012"
+bucket = "my-sandbox-test-bucket"
+region = "us-east-1"
+prefix = "sandbox-bench/tensorlake/"
+seed = "readme.txt"
+```
+
+The two capacity settings need the authenticated `tl` CLI described in [Get started](#get-started). Leave them out if nobody else uses your Tensorlake organization.
+
+Each lifecycle's results are under `cases.<lifecycle>` in `summary.json`. The published mean and P95 are the `mean` and `p95` of each field under `timings_s`. They cover successful workflows only, and `n` is the sample count.
+
+| Published column | Field |
+| --- | --- |
+| Terminal ready | `timings_s.terminal_ready_s` |
+| Disk writable | `timings_s.local_write_ready_s` |
+| S3 verified | `timings_s.s3_verified_s` |
+| Workflow complete | `timings_s.full_workflow_s` |
+| Provider call | `timings_s.provider_lifecycle_s` |
+| Harness setup | `timings_s.harness_setup_s` |
+| Guest workflow | `timings_s.guest_workflow_s` |
+| Outside S3 readback | `timings_s.external_verification_s` |
+| Reliability: passed every check for the full minute | `clean_activity` out of `requested` |
+| Reliability: completed the workflow, such as Beam resume's 38 of 100 | `passed` out of `requested` |
+
+Two exact-value columns are not in `summary.json`. The clock alignment interval in Figure 1's table is the width of each trial's guest/controller clock bound on the disk-writable milestone. The scheduler overlap in Figure 2's table is the controller event-loop lateness that fell inside the provider call. It is an upper bound and is never subtracted from other timings. With the virtual environment active, print both for one lifecycle of a run:
+
+```sh
+python3 - fresh outputs/tensorlake-<run-id> <<'EOF'
+import json, statistics, sys
+from pathlib import Path
+from sandbox_bench.runner import Evidence
+
+case, run = sys.argv[1:]
+rows = [
+    r for r in Evidence.read_state(run)["trials"]
+    if r["case"] == case and r["status"] == "passed"
+]
+loop = json.loads((Path(run) / "controller-observations.json").read_text())["event_loop"]
+clock = [
+    r["milestone_observation_bounds_s"]["local_write"]["latest"]
+    - r["milestone_observation_bounds_s"]["local_write"]["earliest"]
+    for r in rows
+]
+overlap = [
+    sum(
+        max(0, min(s["received"], r["lifecycle_observation"]["received_monotonic"])
+            - max(s["scheduled"], r["t0"]))
+        for s in loop
+    )
+    for r in rows
+]
+print(f"clock alignment interval mean={statistics.mean(clock):.2f}")
+print(f"scheduler overlap mean={statistics.mean(overlap):.2f}")
+EOF
+```
+
+The November 18 runs were scored before `activity_protocol` was recorded. A rerun scores the activity minute with `monotonic-interval-v1`, so its clean-minute counts can differ slightly from ours.
+
+### N=1,000: Figure 3
+
+We ran N=1,000 as several smaller runs and pooled their successful trials:
+
+| Provider | Runs | Settings in each run |
+| --- | --- | --- |
+| Tensorlake | Four runs, each with all four lifecycles | `count = 250`, `batch_size = 250`, `concurrency = 64`, `customer_headroom = 500`, `organization_sandbox_limit = 1000`, `ttl_seconds = 1800` |
+| Modal | Four runs per lifecycle, one lifecycle per run | `count = 250`, `batch_size = 250`, `concurrency = 64`, `ttl_seconds = 1200` |
+| Boat | Runs of 100 until each lifecycle reached 1,000, over November 19–23 to stay inside the start allowance | `count = 100`, `batch_size = 100`, `concurrency = 3` |
+
+Give each campaign its own `--output` directory, so a glob picks up only its runs. Then pool one timing field for one lifecycle:
+
+```sh
+python3 - full_workflow_s fresh outputs/n1000-tensorlake/tensorlake-* <<'EOF'
+import math, statistics, sys
+from sandbox_bench.runner import Evidence
+
+field, case, *runs = sys.argv[1:]
+values = sorted(
+    r[field]
+    for run in runs
+    for r in Evidence.read_state(run)["trials"]
+    if r["case"] == case and r["status"] == "passed" and r.get(field) is not None
+)
+p95 = values[math.ceil(len(values) * 0.95) - 1]
+print(f"n={len(values)} min={values[0]:.2f} mean={statistics.mean(values):.2f} "
+      f"p95={p95:.2f} max={values[-1]:.2f}")
+EOF
+```
+
+Figure 3's three views are `terminal_ready_s` for `fresh`, `full_workflow_s` for `fresh`, and `full_workflow_s` for `memory`. The command prints the minimum, mean, P95 and maximum shown in its exact-values table. It works for any timing field and lifecycle, including a single N=100 run.
+
+### What this harness does not produce
+
+- Figure 4, 20 sequential commands in each of 100 disk-snapshot sandboxes, ran with a separate script on October 23 for Tensorlake and Modal and November 2 for Boat. That script is not in this repository yet, and `suite = "commands"` is a smoke test, not that benchmark.
+- The Vercel row of the reliability table used a Vercel adapter that is not in this repository yet.
+- The Blaxel resume row, a wake from automatic standby, used the change in [#10](https://github.com/General-Intelligence-Company/sandbox-benchmarks/pull/10), which is not merged yet. Until it is, the Blaxel adapter supports `fresh` and `memory` only.
 
 ## Read the results
 
